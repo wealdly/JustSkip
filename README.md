@@ -7,7 +7,7 @@ Toggle or hold a hotkey to speed up the game. Fully configurable, supports keybo
 - **Toggle speeds** — press to lock a speed, press again for 1x (mutually exclusive)
 - **Hold speed** — fast only while held, overrides any active toggle
 - **Hot-reload** — edit the INI mid-game, press F6 to apply
-- **Gamepad** — XInput with LB + face button combos (bypasses Steam Input)
+- **Gamepad** — XInput with Back/View + face button combos (bypasses Steam Input)
 - **Combat detection** — optional multi-signal fusion resets speed during fights
 - **Patch-proof** — hooks QueryPerformanceCounter, not game code — survives updates
 
@@ -15,11 +15,11 @@ Toggle or hold a hotkey to speed up the game. Fully configurable, supports keybo
 
 | Keyboard | Gamepad | Mode | Speed |
 |----------|---------|------|-------|
-| F7 | LB + X | Toggle | 1.2x |
-| F8 | — | Toggle | 2x |
-| F9 | — | Toggle | 4x |
-| F10 | LB + A | Hold | 8x |
 | F6 | — | — | Reload config |
+| F7 | Back + X | Toggle | 1.2x |
+| F8 | — | Toggle | 2x |
+| F9 | Back + A | Toggle | 4x |
+| F10 | — | Hold | 8x |
 
 XInput is read directly from System32, bypassing Steam Input entirely.
 

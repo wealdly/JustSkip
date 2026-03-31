@@ -901,7 +901,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Always log startup details regardless of DebugLog setting
     g_debugLog = true;
-    Log("=== JustSkip v2.1 starting ===");
+    Log("=== JustSkip v2.2 starting ===");
     Log("INI path: %s", g_iniPath);
     Log("Log path: %s", g_logPath);
 
