@@ -126,8 +126,10 @@ static int ReadIniHex(const char* section, const char* key, int def) {
 //  Load config
 // ---------------------------------------------------------------------------
 static void LoadConfig() {
+    bool wasDebug = g_debugLog;  // preserve caller's debug state
     g_enabled  = ReadIniInt("Settings", "Enabled", 1) != 0;
     g_debugLog = ReadIniInt("Settings", "DebugLog", 0) != 0;
+    if (wasDebug) g_debugLog = true;  // don't let INI silence an active session
     g_reloadKey = ReadIniHex("Settings", "ReloadKey", 0x00);
 
     // Gamepad settings
@@ -899,13 +901,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Always log startup details regardless of DebugLog setting
     g_debugLog = true;
-    Log("=== JustSkip v1.0 starting ===");
+    Log("=== JustSkip v2.1 starting ===");
     Log("INI path: %s", g_iniPath);
     Log("Log path: %s", g_logPath);
 
     LoadConfig();
 
-    // Keep logging through startup, then respect INI setting
+    // LoadConfig() overwrites g_debugLog from INI — save that, then force logging
+    // through the rest of startup so all init messages are always visible.
     bool userDebug = g_debugLog;
     g_debugLog = true;
 

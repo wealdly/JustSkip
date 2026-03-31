@@ -7,21 +7,21 @@ Toggle or hold a hotkey to speed up the game. Fully configurable, supports keybo
 - **Toggle speeds** — press to lock a speed, press again for 1x (mutually exclusive)
 - **Hold speed** — fast only while held, overrides any active toggle
 - **Hot-reload** — edit the INI mid-game, press F6 to apply
-- **Gamepad** — XInput with modifier + D-pad combos (bypasses Steam Input)
+- **Gamepad** — XInput with LB + face button combos (bypasses Steam Input)
 - **Combat detection** — optional multi-signal fusion resets speed during fights
 - **Patch-proof** — hooks QueryPerformanceCounter, not game code — survives updates
 
 ## Default Hotkeys
 
-| Keyboard | Gamepad (Back +) | Mode | Speed |
-|----------|------------------|------|-------|
-| F7 | D-pad Up | Toggle | 1.2x |
-| F8 | D-pad Left | Toggle | 2x |
-| F9 | D-pad Down | Toggle | 4x |
-| F10 | D-pad Right | Hold | 8x |
-| F6 | Start | — | Reload config |
+| Keyboard | Gamepad | Mode | Speed |
+|----------|---------|------|-------|
+| F7 | LB + X | Toggle | 1.2x |
+| F8 | — | Toggle | 2x |
+| F9 | — | Toggle | 4x |
+| F10 | LB + A | Hold | 8x |
+| F6 | — | — | Reload config |
 
-Why Back/View as modifier? Least disruptive during cutscenes — the primary use case for speed control. XInput is read directly from System32, bypassing Steam Input entirely.
+XInput is read directly from System32, bypassing Steam Input entirely.
 
 ## Installation
 
@@ -60,7 +60,7 @@ Edit `JustSkip.ini` to customize hotkeys, speeds, toggle/hold modes, and gamepad
 ```ini
 [Speed1]
 Hotkey=76           ; F7
-GamepadButton=0001  ; D-pad Up
+GamepadButton=4000  ; X
 Hold=0              ; 0 = toggle, 1 = hold
 Speed=1.2
 ```
@@ -69,8 +69,7 @@ Speed=1.2
 ```ini
 [Settings]
 GamepadEnabled=1           ; 0 = keyboard only (skips XInput entirely)
-GamepadModifier=0020       ; Back/View (hold first)
-GamepadReloadButton=0010   ; Start (with modifier)
+GamepadModifier=0100       ; LB (hold first)
 GamepadIndex=0             ; Controller 0-3
 ```
 
@@ -145,7 +144,7 @@ Shift=`10` · Ctrl=`11` · Alt=`12` · Tab=`09` · Space=`20` · Esc=`1B` · Ent
 **Keyboard:** W/A/S/D, Shift, Space, Q, LMB/RMB, 1-8, R, F, V, E, I/Tab, M, J, P, H, Esc, F1-F5, F12
 **Safe:** F6-F10 (defaults), numpad, Home/End/Insert/PgUp/PgDn
 
-**Gamepad:** All face/bumper/trigger/stick buttons used in combat. D-pad and Start are safe with a modifier. Back/View is the best modifier.
+**Gamepad:** All face/bumper/trigger/stick buttons used in combat. LB is the default modifier — hold it first, then press the speed button.
 
 </details>
 

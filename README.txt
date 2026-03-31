@@ -18,17 +18,15 @@ FEATURES
 DEFAULT HOTKEYS
 ---------------
 
-  Keyboard        Gamepad (Back +)        Mode        Speed
-  --------        ----------------        ----        -----
-  F7              D-pad Up                Toggle      1.2x
-  F8              D-pad Left              Toggle      2x
-  F9              D-pad Down              Toggle      4x
-  F10             D-pad Right             Hold        8x
-  F6              Start                   —           Reload config
+  Keyboard        Gamepad             Mode        Speed
+  --------        -------             ----        -----
+  F7              LB + X              Toggle      1.2x
+  F8              —                   Toggle      2x
+  F9              —                   Toggle      4x
+  F10             LB + A              Hold        8x
+  F6              —                   —           Reload config
 
-  Why Back/View as modifier? Least disruptive during cutscenes — the primary
-  use case for speed control. XInput is read directly from System32, bypassing
-  Steam Input entirely.
+  XInput is read directly from System32, bypassing Steam Input entirely.
 
 INSTALLATION
 ------------
@@ -73,7 +71,7 @@ CONFIGURATION
 
     [Speed1]
     Hotkey=76           ; F7
-    GamepadButton=0001  ; D-pad Up
+    GamepadButton=4000  ; X
     Hold=0              ; 0 = toggle, 1 = hold
     Speed=1.2
 
@@ -81,8 +79,7 @@ CONFIGURATION
 
     [Settings]
     GamepadEnabled=1           ; 0 = keyboard only (skips XInput entirely)
-    GamepadModifier=0020       ; Back/View (hold first)
-    GamepadReloadButton=0010   ; Start (with modifier)
+    GamepadModifier=0100       ; LB (hold first)
     GamepadIndex=0             ; Controller 0-3
 
   Set GamepadEnabled=0 to disable all gamepad functionality (no XInput loading or polling).

@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.1 — 2026-03-31
+
+### Changed
+- Simplified gamepad defaults to two bindings: LB + X (1.2x toggle), LB + A (8x hold)
+- Changed gamepad modifier from Back/View to LB
+- Removed gamepad reload button binding (keyboard F6 only)
+- Default fastest speed changed from 12x to 8x
+
+### Fixed
+- Startup logging silenced inside `LoadConfig()` — config details (gamepad status, combat settings) now print to log
+- Version string corrected (was still showing v1.0)
+
 ## v2.0 — 2026-03-31
 
 ### Added
