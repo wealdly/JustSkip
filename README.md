@@ -29,6 +29,8 @@ Skip through slow animations, long cutscenes, tedious crafting, and endless trav
 
 ### JSON Mod Manager (recommended)
 
+Requires [JSON Mod Manager](https://www.nexusmods.com/crimsondesert/mods/113) by PhorgeForge.
+
 1. Download `JustSkip-v1.0-CDMM.zip`
 2. Extract the `_asi` folder into your JSON Mod Manager `mods/` directory
 3. Open JSON Mod Manager — JustSkip will appear in the ASI mods list
@@ -36,11 +38,12 @@ Skip through slow animations, long cutscenes, tedious crafting, and endless trav
 
 ### Manual Install
 
+Requires [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases) — download the `winmm.dll` version and place it in your `bin64/` folder if you don't already have one.
+
 1. Download `JustSkip-v1.0-Manual.zip`
 2. Extract both files into your Crimson Desert `bin64/` folder:
    - `JustSkip.asi`
    - `JustSkip.ini`
-3. Requires an ASI loader (`winmm.dll` or `version.dll`) already present in `bin64/`
 
 ## Configuration
 

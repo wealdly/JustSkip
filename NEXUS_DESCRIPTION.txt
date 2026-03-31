@@ -38,6 +38,7 @@ Edit [font=Courier New]JustSkip.ini[/font] to:
 [size=3][b]Installation[/b][/size]
 
 [b]JSON Mod Manager (recommended):[/b]
+Requires [url=https://www.nexusmods.com/crimsondesert/mods/113]JSON Mod Manager[/url] by PhorgeForge.
 [list=1]
 [*]Download the CDMM version
 [*]Extract the [font=Courier New]_asi[/font] folder into your JSON Mod Manager [font=Courier New]mods/[/font] directory
@@ -46,10 +47,10 @@ Edit [font=Courier New]JustSkip.ini[/font] to:
 [/list]
 
 [b]Manual Install:[/b]
+Requires [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] — download the [font=Courier New]winmm.dll[/font] version and place it in your [font=Courier New]bin64/[/font] folder if you don't already have one.
 [list=1]
 [*]Download the Manual version
 [*]Extract both files ([font=Courier New]JustSkip.asi[/font] + [font=Courier New]JustSkip.ini[/font]) into your Crimson Desert [font=Courier New]bin64/[/font] folder
-[*]Requires an ASI loader already present (winmm.dll or version.dll)
 [/list]
 
 [size=3][b]Patch-Proof[/b][/size]
