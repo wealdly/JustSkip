@@ -4,31 +4,82 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <Xinput.h>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
-#include <mutex>
+
+#pragma comment(lib, "gdi32.lib")
 
 #include "MinHook.h"
+
+// ---------------------------------------------------------------------------
+//  XInput — types and state (implementation after Log/Config below)
+// ---------------------------------------------------------------------------
+typedef DWORD(WINAPI* PFN_XInputGetState)(DWORD dwUserIndex, XINPUT_STATE* pState);
+typedef DWORD(WINAPI* PFN_XInputSetState)(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration);
+static PFN_XInputGetState g_pXInputGetState     = nullptr; // raw fn ptr for our polling
+static PFN_XInputSetState g_origXInputSetState   = nullptr; // trampoline for game's calls
+static bool               g_xinputLoaded         = false;
+static int                g_detectedPadIndex     = -1;     // auto-detected at runtime
+
+
 
 // ---------------------------------------------------------------------------
 //  Configuration (loaded from INI)
 // ---------------------------------------------------------------------------
 struct SpeedSlot {
-    int  vkKey;       // Virtual-key code
-    bool isHold;      // true = active only while held, false = toggle
-    float speed;      // multiplier
-    bool active;      // runtime state for toggles
+    int    vkKey;         // Virtual-key code (keyboard)
+    WORD   gamepadButton; // XInput button flag (0 = none)
+    bool   isHold;        // true = active only while held, false = toggle
+    float  speed;         // multiplier
+    bool   active;        // runtime state for toggles
 };
 
 static SpeedSlot  g_slots[6];
 static int        g_slotCount  = 0;
-static float      g_baseSpeed  = 1.0f;   // the "normal" speed (always 1.0)
 static bool       g_enabled    = true;
 static int        g_reloadKey  = 0;
+static WORD       g_gamepadModifier   = 0;  // XInput buttons that must be held
+static WORD       g_gamepadReloadBtn  = 0;  // XInput button for reload (with modifier)
+static int        g_gamepadIndex      = 0;  // Controller index 0-3
 static bool       g_debugLog   = false;
 static char       g_iniPath[MAX_PATH];
 static char       g_logPath[MAX_PATH];
+
+// Combat detection (multi-signal fusion)
+static bool       g_combatDetect    = false;  // feature enabled?
+static float      g_combatSpeed     = 1.0f;   // speed during combat (e.g. 0.95)
+static DWORD      g_combatTimeout   = 3000;   // ms after last signal to exit combat
+static WORD       g_combatVibThresh = 5000;   // vibration intensity threshold
+static WORD       g_combatAttackMask= 0;      // XInput buttons considered "attack"
+static int        g_combatMashCount = 3;      // attack presses within window = combat
+static DWORD      g_combatMashWindow= 2000;   // ms window for mash detection
+static std::atomic<DWORD> g_lastCombatSignal{0};  // unified: any combat signal timestamp
+
+// Signature-based combat detection (advanced, optional)
+static BYTE*      g_combatFlagAddr  = nullptr; // resolved ptr to game's combat flag
+static char       g_combatSigPattern[512] = {}; // AOB pattern from INI
+static int        g_combatSigOffset = 0;        // offset from pattern match to flag
+
+// Auto-reset: reset toggle speed on load transitions
+static bool       g_resetOnLoad     = false;     // default OFF = toggles persist always
+
+// Load-transition signal: set by QPC gap path, consumed by hotkey thread
+static std::atomic<bool> g_loadTransitionDetected{false};
+
+// Hold-key safety
+static DWORD      g_maxHoldMs       = 120000;   // max continuous hold before force-release
+static bool       g_holdFocusCheck  = true;      // release holds when game not foreground
+
+// On-screen display (OSD)
+static bool       g_osdEnabled      = true;
+static DWORD      g_osdDuration     = 2000;      // ms to show notification
+static int        g_osdFontSize     = 22;
+static int        g_osdPosX         = 20;        // offset from top-left of game window
+static int        g_osdPosY         = 20;
+static HWND       g_osdWnd          = nullptr;
+static DWORD      g_osdThreadId     = 0;
 
 // ---------------------------------------------------------------------------
 //  Logging
@@ -80,6 +131,57 @@ static void LoadConfig() {
     g_debugLog = ReadIniInt("Settings", "DebugLog", 0) != 0;
     g_reloadKey = ReadIniHex("Settings", "ReloadKey", 0x00);
 
+    // Gamepad settings
+    g_gamepadModifier  = (WORD)ReadIniHex("Settings", "GamepadModifier", 0x0000);
+    g_gamepadReloadBtn = (WORD)ReadIniHex("Settings", "GamepadReloadButton", 0x0000);
+    g_gamepadIndex     = ReadIniInt("Settings", "GamepadIndex", 0);
+    if (g_gamepadIndex < 0 || g_gamepadIndex > 3) g_gamepadIndex = 0;
+
+    // Combat detection (multi-signal fusion)
+    g_combatDetect    = ReadIniInt("Combat", "Enabled", 0) != 0;
+    g_combatSpeed     = ReadIniFloat("Combat", "CombatSpeed", 1.0f);
+    g_combatTimeout   = (DWORD)ReadIniInt("Combat", "Timeout", 3000);
+    g_combatVibThresh = (WORD)ReadIniInt("Combat", "VibrationThreshold", 5000);
+    g_combatMashCount = ReadIniInt("Combat", "MashCount", 3);
+    g_combatMashWindow= (DWORD)ReadIniInt("Combat", "MashWindow", 2000);
+
+    // Attack buttons mask — default: RT(bit from triggers not in wButtons), X, Y, RB
+    // XInput wButtons doesn't include triggers, so we use face buttons + bumpers
+    g_combatAttackMask = (WORD)ReadIniHex("Combat", "AttackButtons", 0xC200); // X+Y+RB
+
+    // Signature pattern (advanced)
+    GetPrivateProfileStringA("Combat", "SignaturePattern", "",
+                             g_combatSigPattern, sizeof(g_combatSigPattern), g_iniPath);
+    g_combatSigOffset = ReadIniInt("Combat", "SignatureOffset", 0);
+
+    Log("Combat detection: %s, speed=%.2f, timeout=%lu ms, vibThresh=%u",
+        g_combatDetect ? "ON" : "OFF", g_combatSpeed, g_combatTimeout, g_combatVibThresh);
+    Log("  AttackButtons=0x%04X, MashCount=%d, MashWindow=%lu",
+        g_combatAttackMask, g_combatMashCount, g_combatMashWindow);
+    if (g_combatSigPattern[0])
+        Log("  SignaturePattern: %s (offset=%d)", g_combatSigPattern, g_combatSigOffset);
+
+    Log("Gamepad: modifier=0x%04X reload=0x%04X index=%d",
+        g_gamepadModifier, g_gamepadReloadBtn, g_gamepadIndex);
+
+    // Hold-key safety
+    g_maxHoldMs    = (DWORD)ReadIniInt("Settings", "MaxHoldSeconds", 120) * 1000;
+    g_holdFocusCheck = ReadIniInt("Settings", "HoldFocusCheck", 1) != 0;
+    Log("Hold safety: maxHold=%lus focusCheck=%d", g_maxHoldMs / 1000, g_holdFocusCheck);
+
+    // OSD (on-screen display)
+    g_osdEnabled  = ReadIniInt("OSD", "Enabled", 1) != 0;
+    g_osdDuration = (DWORD)ReadIniInt("OSD", "Duration", 2000);
+    g_osdFontSize = ReadIniInt("OSD", "FontSize", 22);
+    g_osdPosX     = ReadIniInt("OSD", "PosX", 20);
+    g_osdPosY     = ReadIniInt("OSD", "PosY", 20);
+    Log("OSD: %s, duration=%lums, font=%d, pos=(%d,%d)",
+        g_osdEnabled ? "ON" : "OFF", g_osdDuration, g_osdFontSize, g_osdPosX, g_osdPosY);
+
+    // Auto-reset on load transitions
+    g_resetOnLoad = ReadIniInt("AutoReset", "ResetOnLoad", 0) != 0;
+    Log("AutoReset: onLoad=%d", g_resetOnLoad);
+
     // Read speed slots — up to 6 sections named Speed1..Speed6
     g_slotCount = 0;
     for (int i = 1; i <= 6 && g_slotCount < 6; i++) {
@@ -88,19 +190,191 @@ static void LoadConfig() {
 
         char keyBuf[32];
         GetPrivateProfileStringA(section, "Hotkey", "", keyBuf, sizeof(keyBuf), g_iniPath);
-        if (keyBuf[0] == '\0') continue;
+
+        char padBuf[32];
+        GetPrivateProfileStringA(section, "GamepadButton", "", padBuf, sizeof(padBuf), g_iniPath);
+
+        // Skip slot only if BOTH keyboard and gamepad are unconfigured
+        if (keyBuf[0] == '\0' && padBuf[0] == '\0') continue;
 
         SpeedSlot& s = g_slots[g_slotCount];
-        s.vkKey  = ParseHexOrDec(keyBuf);
-        s.isHold = ReadIniInt(section, "Hold", 0) != 0;
-        s.speed  = ReadIniFloat(section, "Speed", 1.0f);
-        s.active = false;
+        s.vkKey        = ParseHexOrDec(keyBuf);
+        s.gamepadButton = (WORD)ParseHexOrDec(padBuf);
+        s.isHold       = ReadIniInt(section, "Hold", 0) != 0;
+        s.speed        = ReadIniFloat(section, "Speed", 1.0f);
+        s.active       = false;
         g_slotCount++;
 
-        Log("  Slot %d: key=0x%02X hold=%d speed=%.2f", i, s.vkKey, s.isHold, s.speed);
+        Log("  Slot %d: key=0x%02X pad=0x%04X hold=%d speed=%.2f",
+            i, s.vkKey, s.gamepadButton, s.isHold, s.speed);
     }
 
     Log("Config loaded: %d slots, enabled=%d", g_slotCount, g_enabled);
+}
+
+// ---------------------------------------------------------------------------
+//  AOB Signature Scanner (for combat flag detection)
+// ---------------------------------------------------------------------------
+static bool ParseAOB(const char* pattern, BYTE* out, bool* mask, int maxLen, int& outLen) {
+    outLen = 0;
+    const char* p = pattern;
+    while (*p && outLen < maxLen) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        if (*p == '?' && (*(p+1) == '?' || *(p+1) == ' ' || *(p+1) == '\0')) {
+            out[outLen] = 0;
+            mask[outLen] = false; // wildcard
+            outLen++;
+            p += (*p == '?' && *(p+1) == '?') ? 2 : 1;
+        } else {
+            char hex[3] = { p[0], p[1], 0 };
+            out[outLen] = (BYTE)strtoul(hex, nullptr, 16);
+            mask[outLen] = true;
+            outLen++;
+            p += 2;
+        }
+    }
+    return outLen > 0;
+}
+
+static BYTE* ScanSignature(const char* pattern, int offset) {
+    BYTE sig[256];
+    bool msk[256];
+    int  sigLen = 0;
+
+    if (!ParseAOB(pattern, sig, msk, 256, sigLen) || sigLen == 0) {
+        Log("Signature: failed to parse pattern");
+        return nullptr;
+    }
+
+    // Scan the main executable module's .text section
+    HMODULE hExe = GetModuleHandleA(nullptr);
+    if (!hExe) return nullptr;
+
+    BYTE* base = (BYTE*)hExe;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    IMAGE_NT_HEADERS* nt  = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            BYTE* start = base + sec[i].VirtualAddress;
+            DWORD size  = sec[i].Misc.VirtualSize;
+
+            for (DWORD j = 0; j <= size - sigLen; j++) {
+                bool found = true;
+                for (int k = 0; k < sigLen; k++) {
+                    if (msk[k] && start[j + k] != sig[k]) {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) {
+                    BYTE* match = start + j;
+                    Log("Signature found at %p (base+0x%llX)",
+                        match, (ULONGLONG)(match - base));
+
+                    // If offset is relative (dereference a 32-bit RIP-relative offset)
+                    // Common pattern: instruction at match+offset contains a rel32
+                    // The combat flag = match+offset+4 + *(int32_t*)(match+offset)
+                    if (offset >= 0) {
+                        BYTE* flagAddr = match + offset;
+                        // Check if this looks like a RIP-relative address
+                        // (offset points to a 4-byte displacement in the instruction)
+                        int32_t relDisp = *(int32_t*)flagAddr;
+                        BYTE* resolved = flagAddr + 4 + relDisp;
+                        Log("Signature: offset=%d, rel32=%d, resolved=%p", offset, relDisp, resolved);
+                        return resolved;
+                    }
+                    return match;
+                }
+            }
+        }
+    }
+    Log("Signature: pattern not found in executable");
+    return nullptr;
+}
+
+static void ResolveCombatSignature() {
+    if (g_combatSigPattern[0] == '\0') return;
+    g_combatFlagAddr = ScanSignature(g_combatSigPattern, g_combatSigOffset);
+    if (g_combatFlagAddr) {
+        Log("Combat flag resolved at %p (value=%u)", g_combatFlagAddr, *g_combatFlagAddr);
+    } else {
+        Log("WARNING: Combat signature scan failed — falling back to signal fusion");
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  XInput — dynamic loading (bypass Steam overlay by loading from System32)
+// ---------------------------------------------------------------------------
+typedef DWORD(WINAPI* PFN_XInputGetStateEx)(DWORD dwUserIndex, XINPUT_STATE* pState);
+static PFN_XInputGetStateEx g_pXInputGetStateEx = nullptr;
+
+// Unified helper — prefer undocumented GetStateEx, fall back to GetState
+static DWORD CallXInputGetState(DWORD idx, XINPUT_STATE* pState) {
+    if (g_pXInputGetStateEx) return g_pXInputGetStateEx(idx, pState);
+    if (g_pXInputGetState)   return g_pXInputGetState(idx, pState);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
+// XInputSetState hook — detect vibration (combat indicator)
+static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration) {
+    if (g_combatDetect && pVibration) {
+        WORD maxMotor = pVibration->wLeftMotorSpeed > pVibration->wRightMotorSpeed
+                      ? pVibration->wLeftMotorSpeed : pVibration->wRightMotorSpeed;
+        // Only count vibration above the threshold (filters horse ride, cutscene rumble)
+        if (maxMotor >= g_combatVibThresh) {
+            DWORD now = GetTickCount();
+            DWORD prev = g_lastCombatSignal.load(std::memory_order_relaxed);
+            g_lastCombatSignal.store(now, std::memory_order_relaxed);
+            if (prev == 0 || (now - prev) > g_combatTimeout) {
+                Log("Combat signal: vibration (L=%u R=%u, max=%u >= thresh=%u)",
+                    pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed,
+                    maxMotor, g_combatVibThresh);
+            }
+        }
+    }
+    return g_origXInputSetState ? g_origXInputSetState(dwUserIndex, pVibration) : ERROR_SUCCESS;
+}
+
+static void LoadXInput() {
+    // Strategy: load directly from System32 to bypass Steam's XInput wrapper.
+    // Steam hooks GetModuleHandle/LoadLibrary for xinput DLLs and returns its own
+    // proxy that can return stale/zero data even when "Steam Input" is disabled.
+
+    char sysDir[MAX_PATH];
+    GetSystemDirectoryA(sysDir, MAX_PATH);
+
+    static const char* dllNames[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+
+    for (auto name : dllNames) {
+        char fullPath[MAX_PATH];
+        sprintf_s(fullPath, "%s\\%s", sysDir, name);
+
+        // Use LOAD_LIBRARY_SEARCH_SYSTEM32 to guarantee we get the real DLL
+        HMODULE hMod = LoadLibraryExA(fullPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!hMod) {
+            Log("  LoadLibraryExA(%s) failed (err=%lu)", fullPath, GetLastError());
+            continue;
+        }
+
+        // Try XInputGetStateEx (ordinal 100) — undocumented, reports Guide button,
+        // and sometimes bypasses filtering that affects the standard export
+        auto pfnEx = (PFN_XInputGetStateEx)GetProcAddress(hMod, MAKEINTRESOURCEA(100));
+        auto pfn = (PFN_XInputGetState)GetProcAddress(hMod, "XInputGetState");
+        if (!pfn) pfn = (PFN_XInputGetState)GetProcAddress(hMod, MAKEINTRESOURCEA(3));
+
+        if (pfn || pfnEx) {
+            g_pXInputGetState   = pfn;
+            g_pXInputGetStateEx = pfnEx;
+            g_xinputLoaded = true;
+            Log("XInput loaded from %s (%s)", fullPath, pfnEx ? "GetStateEx" : "GetState");
+            return;
+        }
+        FreeLibrary(hMod);
+    }
+    Log("WARNING: Could not load any XInput DLL from System32 — gamepad support disabled");
 }
 
 // ---------------------------------------------------------------------------
@@ -109,21 +383,32 @@ static void LoadConfig() {
 typedef BOOL(WINAPI* PFN_QPC)(LARGE_INTEGER* lpCounter);
 static PFN_QPC g_origQPC = nullptr;
 
-static std::mutex    g_timeMtx;
+static SRWLOCK       g_timeLock   = SRWLOCK_INIT;
 static LARGE_INTEGER g_realBase   = {};
 static LARGE_INTEGER g_fakeBase   = {};
 static double        g_curSpeed   = 1.0;
 static bool          g_timeInited = false;
+static LONGLONG      g_qpcFreq    = 0;     // cached QPC frequency
+static LONGLONG      g_gapThreshold = 0;   // max real delta before reset (2s)
 
 static void SetSpeed(double speed) {
-    std::lock_guard<std::mutex> lk(g_timeMtx);
+    AcquireSRWLockExclusive(&g_timeLock);
 
     LARGE_INTEGER realNow;
     g_origQPC(&realNow);
 
     if (g_timeInited) {
-        double realDelta = (double)(realNow.QuadPart - g_realBase.QuadPart);
-        g_fakeBase.QuadPart = g_fakeBase.QuadPart + (LONGLONG)(realDelta * g_curSpeed);
+        LONGLONG realDelta = realNow.QuadPart - g_realBase.QuadPart;
+        LONGLONG threshold = (g_curSpeed > 1.0)
+            ? (LONGLONG)(g_gapThreshold / g_curSpeed) : g_gapThreshold;
+        if (realDelta > 0 && realDelta < threshold) {
+            g_fakeBase.QuadPart += (LONGLONG)((double)realDelta * g_curSpeed);
+        } else {
+            // Gap too large — pass through at 1:1 to avoid time explosion
+            g_fakeBase.QuadPart += realDelta;
+            Log("SetSpeed: gap reset (delta=%lld ticks, %.2fs)",
+                realDelta, g_qpcFreq ? (double)realDelta / g_qpcFreq : 0.0);
+        }
     } else {
         g_fakeBase = realNow;
         g_timeInited = true;
@@ -131,27 +416,205 @@ static void SetSpeed(double speed) {
 
     g_realBase = realNow;
     g_curSpeed = speed;
+
+    ReleaseSRWLockExclusive(&g_timeLock);
 }
 
 static BOOL WINAPI HookedQPC(LARGE_INTEGER* lpCounter) {
     if (!lpCounter) return FALSE;
 
-    std::lock_guard<std::mutex> lk(g_timeMtx);
-
     LARGE_INTEGER realNow;
     g_origQPC(&realNow);
 
+    // Fast shared path — covers 99%+ of calls (no writes to shared state)
+    AcquireSRWLockShared(&g_timeLock);
+
     if (!g_timeInited) {
+        ReleaseSRWLockShared(&g_timeLock);
+        AcquireSRWLockExclusive(&g_timeLock);
+        if (!g_timeInited) {            // double-check after upgrade
+            g_realBase = realNow;
+            g_fakeBase = realNow;
+            g_timeInited = true;
+        }
         *lpCounter = realNow;
-        g_realBase = realNow;
-        g_fakeBase = realNow;
-        g_timeInited = true;
+        ReleaseSRWLockExclusive(&g_timeLock);
         return TRUE;
     }
 
-    double realDelta = (double)(realNow.QuadPart - g_realBase.QuadPart);
-    lpCounter->QuadPart = g_fakeBase.QuadPart + (LONGLONG)(realDelta * g_curSpeed);
+    LONGLONG realDelta = realNow.QuadPart - g_realBase.QuadPart;
+
+    // Scale threshold inversely with speed so the max *fake-time* jump stays
+    // capped at ~2 s regardless of multiplier.  At 12×, a real 0.17 s pause
+    // already produces a 2 s fake jump — anything longer is a load transition.
+    double speed = g_curSpeed;
+    LONGLONG threshold = (speed > 1.0) ? (LONGLONG)(g_gapThreshold / speed)
+                                       : g_gapThreshold;
+
+    if (realDelta > 0 && realDelta < threshold) {
+        // Common path: pure read — multiple threads can execute concurrently
+        lpCounter->QuadPart = g_fakeBase.QuadPart + (LONGLONG)((double)realDelta * speed);
+        ReleaseSRWLockShared(&g_timeLock);
+    } else {
+        // Gap path (load screen / transition) — needs exclusive to reset base
+        ReleaseSRWLockShared(&g_timeLock);
+        AcquireSRWLockExclusive(&g_timeLock);
+        g_origQPC(&realNow);  // re-sample after lock upgrade
+        speed = g_curSpeed;   // re-read after lock upgrade
+        threshold = (speed > 1.0) ? (LONGLONG)(g_gapThreshold / speed)
+                                  : g_gapThreshold;
+        realDelta = realNow.QuadPart - g_realBase.QuadPart;
+        if (realDelta > 0 && realDelta < threshold) {
+            lpCounter->QuadPart = g_fakeBase.QuadPart + (LONGLONG)((double)realDelta * speed);
+        } else {
+            g_fakeBase.QuadPart += realDelta;
+            g_realBase = realNow;
+            lpCounter->QuadPart = g_fakeBase.QuadPart;
+            // Signal hotkey thread that a load transition occurred
+            if (g_resetOnLoad)
+                g_loadTransitionDetected.store(true, std::memory_order_relaxed);
+        }
+        ReleaseSRWLockExclusive(&g_timeLock);
+    }
+
     return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+//  On-screen display (OSD) — lightweight overlay for speed notifications
+// ---------------------------------------------------------------------------
+#define WM_OSD_SHOW  (WM_USER + 100)
+#define WM_OSD_HIDE  (WM_USER + 101)
+#define OSD_TIMER_ID 1
+
+static char g_osdText[128] = {};
+
+static void OSD_Paint(HWND hwnd) {
+    char text[128];
+    strncpy_s(text, g_osdText, _TRUNCATE);
+    if (text[0] == '\0') { ShowWindow(hwnd, SW_HIDE); return; }
+
+    // Find game window to position relative to it
+    HWND gameWnd = GetForegroundWindow();
+    RECT gameRect = {};
+    if (gameWnd) GetWindowRect(gameWnd, &gameRect);
+
+    HDC screenDC = GetDC(nullptr);
+    HDC memDC = CreateCompatibleDC(screenDC);
+
+    HFONT font = CreateFontA(-g_osdFontSize, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    SelectObject(memDC, font);
+
+    SIZE sz;
+    GetTextExtentPoint32A(memDC, text, (int)strlen(text), &sz);
+    int w = sz.cx + 24, h = sz.cy + 12;
+
+    // Create 32-bit DIB for per-pixel alpha
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    DWORD* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, dib);
+    SelectObject(memDC, font);
+
+    // Fill background: semi-transparent dark
+    for (int i = 0; i < w * h; i++)
+        bits[i] = 0xC0181818;  // ARGB: ~75% opaque near-black
+
+    // Draw text — GDI ignores alpha, so we detect changed pixels and fix alpha after
+    SetBkMode(memDC, TRANSPARENT);
+    SetTextColor(memDC, RGB(255, 255, 255));
+    RECT rc = { 12, 6, w - 12, h - 6 };
+    DrawTextA(memDC, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    // Fix alpha: GDI sets alpha=0 on text pixels, so detect non-black and force alpha
+    for (int i = 0; i < w * h; i++) {
+        BYTE r = (bits[i] >> 16) & 0xFF;
+        BYTE g = (bits[i] >> 8) & 0xFF;
+        BYTE b = bits[i] & 0xFF;
+        BYTE a = (bits[i] >> 24) & 0xFF;
+        if (a == 0 && (r > 0x20 || g > 0x20 || b > 0x20)) {
+            // Text pixel — make fully opaque and pre-multiply
+            bits[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+        } else {
+            // Background — pre-multiply alpha
+            bits[i] = ((DWORD)a << 24) |
+                      (((r * a) / 255) << 16) |
+                      (((g * a) / 255) << 8) |
+                      ((b * a) / 255);
+        }
+    }
+
+    POINT pos = { gameRect.left + g_osdPosX, gameRect.top + g_osdPosY };
+    SIZE size = { w, h };
+    POINT src = { 0, 0 };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(hwnd, screenDC, &pos, &size, memDC, &src, 0, &blend, ULW_ALPHA);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+    SelectObject(memDC, oldBmp);
+    DeleteObject(dib);
+    DeleteObject(font);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+}
+
+static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_OSD_SHOW:
+        OSD_Paint(hwnd);
+        SetTimer(hwnd, OSD_TIMER_ID, g_osdDuration, nullptr);
+        return 0;
+    case WM_TIMER:
+        if (wParam == OSD_TIMER_ID) {
+            KillTimer(hwnd, OSD_TIMER_ID);
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static DWORD WINAPI OsdThread(LPVOID) {
+    WNDCLASSEXA wc = { sizeof(wc) };
+    wc.lpfnWndProc   = OsdWndProc;
+    wc.hInstance      = GetModuleHandleA(nullptr);
+    wc.lpszClassName  = "JustSkipOSD";
+    RegisterClassExA(&wc);
+
+    g_osdWnd = CreateWindowExA(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        "JustSkipOSD", "", WS_POPUP,
+        0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+
+    if (!g_osdWnd) {
+        Log("WARNING: OSD window creation failed (err=%lu)", GetLastError());
+        return 1;
+    }
+    Log("OSD window created");
+
+    MSG msg;
+    while (GetMessageA(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return 0;
+}
+
+static void ShowOSD(const char* fmt, ...) {
+    if (!g_osdEnabled || !g_osdWnd) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_osdText, sizeof(g_osdText), fmt, ap);
+    va_end(ap);
+    PostMessageA(g_osdWnd, WM_OSD_SHOW, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +623,13 @@ static BOOL WINAPI HookedQPC(LARGE_INTEGER* lpCounter) {
 static DWORD WINAPI HotkeyThread(LPVOID) {
     Log("Hotkey thread started");
 
+    if (g_gamepadModifier != 0) {
+        LoadXInput();
+        g_detectedPadIndex = g_gamepadIndex > 0 ? g_gamepadIndex : -1;
+    }
+
     bool prevDown[6] = {};
+    DWORD holdStart[6] = {};  // tick when hold key first went down (0 = not held)
 
     while (true) {
         Sleep(10);
@@ -170,30 +639,148 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             continue;
         }
 
-        // Reload key (edge-detected)
+        // --- Poll gamepad state (XInput from System32, bypasses Steam) ---
+        static DWORD lastPadAttempt = 0;
+        static bool  padWasConnected = false;
+        WORD padButtons = 0;
+        BYTE padLeftTrigger = 0;
+        bool padConnected = false;
+
+        if (g_xinputLoaded && g_gamepadModifier != 0) {
+            DWORD now = GetTickCount();
+            bool shouldPoll = padWasConnected || (now - lastPadAttempt >= 2000);
+            if (shouldPoll) {
+                if (g_detectedPadIndex < 0) {
+                    DWORD bestPkt = 0;
+                    int   bestIdx = -1;
+                    for (int idx = 0; idx < 4; idx++) {
+                        XINPUT_STATE testState = {};
+                        DWORD r = CallXInputGetState(idx, &testState);
+                        if (r == ERROR_SUCCESS && testState.dwPacketNumber > bestPkt) {
+                            bestPkt = testState.dwPacketNumber;
+                            bestIdx = idx;
+                        }
+                    }
+                    if (bestIdx >= 0) {
+                        g_detectedPadIndex = bestIdx;
+                        Log("Auto-detected controller on index %d (pkt=%lu)", bestIdx, bestPkt);
+                    }
+                    lastPadAttempt = now;
+                }
+                if (g_detectedPadIndex >= 0) {
+                    XINPUT_STATE padState = {};
+                    DWORD result = CallXInputGetState(g_detectedPadIndex, &padState);
+                    padConnected = (result == ERROR_SUCCESS);
+                    if (padConnected) {
+                        padButtons = padState.Gamepad.wButtons;
+                        padLeftTrigger = padState.Gamepad.bLeftTrigger;
+                        if (!padWasConnected) {
+                            Log("Gamepad %d connected (pkt=%lu)",
+                                g_detectedPadIndex, padState.dwPacketNumber);
+                            padWasConnected = true;
+                        }
+                    } else {
+                        if (padWasConnected) {
+                            Log("Gamepad %d disconnected", g_detectedPadIndex);
+                            g_detectedPadIndex = -1;
+                            padWasConnected = false;
+                        }
+                        lastPadAttempt = now;
+                    }
+                }
+            }
+        }
+
+        bool modHeld = padConnected && g_gamepadModifier != 0 &&
+                       (padButtons & g_gamepadModifier) == g_gamepadModifier;
+
+        // --- Reload key (edge-detected, keyboard OR gamepad) ---
         static bool reloadDown = false;
-        if (g_reloadKey && (GetAsyncKeyState(g_reloadKey) & 0x8000)) {
+        bool reloadPressed = false;
+        if (g_reloadKey && (GetAsyncKeyState(g_reloadKey) & 0x8000))
+            reloadPressed = true;
+        if (modHeld && g_gamepadReloadBtn && (padButtons & g_gamepadReloadBtn))
+            reloadPressed = true;
+
+        if (reloadPressed) {
             if (!reloadDown) {
                 reloadDown = true;
                 for (int i = 0; i < g_slotCount; i++)
                     g_slots[i].active = false;
                 LoadConfig();
+                g_detectedPadIndex = g_gamepadIndex > 0 ? g_gamepadIndex : -1;
                 SetSpeed(1.0);
-                Log("Config reloaded via hotkey");
+                Log("Config reloaded");
+                ShowOSD("JustSkip: Config Reloaded");
             }
         } else {
             reloadDown = false;
         }
 
-        float targetSpeed = g_baseSpeed;
+        // --- Auto-reset on load transition ---
+        if (g_loadTransitionDetected.exchange(false, std::memory_order_relaxed)) {
+            bool anyToggleWasActive = false;
+            for (int i = 0; i < g_slotCount; i++) {
+                if (!g_slots[i].isHold && g_slots[i].active) {
+                    anyToggleWasActive = true;
+                    g_slots[i].active = false;
+                }
+            }
+            if (anyToggleWasActive) {
+                SetSpeed(1.0);
+                Log("AutoReset: load transition detected — toggles reset to 1x");
+                ShowOSD("Speed: 1x (Load Reset)");
+            }
+        }
+
+        float targetSpeed = 1.0f;
         bool anyHoldActive = false;
 
-        // Hold keys take priority
+        // --- Focus check: if game isn't foreground, don't trust hold keys ---
+        bool gameFocused = true;
+        if (g_holdFocusCheck) {
+            HWND fg = GetForegroundWindow();
+            if (fg) {
+                DWORD fgPid = 0;
+                GetWindowThreadProcessId(fg, &fgPid);
+                gameFocused = (fgPid == GetCurrentProcessId());
+            }
+        }
+
+        DWORD now = GetTickCount();
+
+        // --- Hold keys take priority (keyboard + gamepad) ---
         for (int i = 0; i < g_slotCount; i++) {
             SpeedSlot& s = g_slots[i];
             if (!s.isHold) continue;
 
-            bool down = (GetAsyncKeyState(s.vkKey) & 0x8000) != 0;
+            bool down = false;
+            if (s.vkKey && (GetAsyncKeyState(s.vkKey) & 0x8000))
+                down = true;
+            if (modHeld && s.gamepadButton && (padButtons & s.gamepadButton))
+                down = true;
+
+            // Safety: force-release if game lost focus
+            if (down && !gameFocused) {
+                down = false;
+                if (holdStart[i]) {
+                    Log("Hold slot %d: force-released (game not focused)", i);
+                    holdStart[i] = 0;
+                }
+            }
+
+            // Safety: force-release if held longer than max duration
+            if (down) {
+                if (!holdStart[i]) holdStart[i] = now;
+                if (g_maxHoldMs > 0 && (now - holdStart[i]) > g_maxHoldMs) {
+                    down = false;
+                    Log("Hold slot %d: force-released (max duration %lums exceeded)", i, g_maxHoldMs);
+                    holdStart[i] = 0;
+                }
+            } else {
+                holdStart[i] = 0;
+            }
+
             if (down) {
                 if (s.speed > targetSpeed)
                     targetSpeed = s.speed;
@@ -201,13 +788,18 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             }
         }
 
-        // Toggle keys (mutually exclusive)
+        // --- Toggle keys (mutually exclusive, keyboard + gamepad) ---
         if (!anyHoldActive) {
             for (int i = 0; i < g_slotCount; i++) {
                 SpeedSlot& s = g_slots[i];
                 if (s.isHold) continue;
 
-                bool down = (GetAsyncKeyState(s.vkKey) & 0x8000) != 0;
+                bool down = false;
+                if (s.vkKey && (GetAsyncKeyState(s.vkKey) & 0x8000))
+                    down = true;
+                if (modHeld && s.gamepadButton && (padButtons & s.gamepadButton))
+                    down = true;
+
                 if (down && !prevDown[i]) {
                     s.active = !s.active;
                     Log("Toggle slot %d: %s (speed=%.2f)", i, s.active ? "ON" : "OFF", s.speed);
@@ -230,11 +822,97 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             }
         }
 
+        // --- Combat detection (multi-signal fusion, optional) ---
+        static bool  wasCombat = false;
+        static DWORD attackTimestamps[16] = {};
+        static int   attackHead = 0;
+        static WORD  prevAttackButtons = 0;
+
+        if (g_combatDetect) {
+            bool inCombat = false;
+
+            // Priority 1: Signature-based (perfect, if available)
+            if (g_combatFlagAddr) {
+                __try {
+                    inCombat = (*g_combatFlagAddr != 0);
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    // Pointer went bad (game update?) — disable
+                    Log("WARNING: Combat signature pointer invalid — disabling");
+                    g_combatFlagAddr = nullptr;
+                }
+            }
+
+            // Priority 2: Multi-signal fusion (heuristic fallback)
+            if (!g_combatFlagAddr) {
+                DWORD lastSig = g_lastCombatSignal.load(std::memory_order_relaxed);
+
+                // Signal A: Strong vibration (already handled by XInputSetState hook,
+                //           updates g_lastCombatSignal directly)
+
+                // Signal B: LT held + attack button (lock-on + attack = combat)
+                if (padConnected && padLeftTrigger > 128 && g_combatAttackMask) {
+                    if (padButtons & g_combatAttackMask) {
+                        DWORD prevSig = lastSig;
+                        g_lastCombatSignal.store(now, std::memory_order_relaxed);
+                        if (prevSig == 0 || (now - prevSig) > g_combatTimeout) {
+                            Log("Combat signal: LT + attack (LT=%u, btns=0x%04X)",
+                                padLeftTrigger, padButtons & g_combatAttackMask);
+                        }
+                        lastSig = now;
+                    }
+                }
+
+                // Signal C: Rapid attack button mashing (3+ presses in 2s)
+                if (padConnected && g_combatAttackMask) {
+                    WORD attackNow = padButtons & g_combatAttackMask;
+                    WORD attackEdge = attackNow & ~prevAttackButtons; // newly pressed
+                    prevAttackButtons = attackNow;
+
+                    if (attackEdge) {
+                        attackTimestamps[attackHead % 16] = now;
+                        attackHead++;
+
+                        // Count presses within the mash window
+                        int recentPresses = 0;
+                        for (int k = 0; k < 16; k++) {
+                            if (attackTimestamps[k] && (now - attackTimestamps[k]) <= g_combatMashWindow)
+                                recentPresses++;
+                        }
+                        if (recentPresses >= g_combatMashCount) {
+                            g_lastCombatSignal.store(now, std::memory_order_relaxed);
+                            if (lastSig == 0 || (now - lastSig) > g_combatTimeout) {
+                                Log("Combat signal: attack mash (%d presses in %lums)",
+                                    recentPresses, g_combatMashWindow);
+                            }
+                        }
+                    }
+                }
+
+                lastSig = g_lastCombatSignal.load(std::memory_order_relaxed);
+                inCombat = (lastSig != 0) && (now - lastSig) < g_combatTimeout;
+            }
+
+            if (inCombat) {
+                targetSpeed = g_combatSpeed;
+                if (!wasCombat) {
+                    Log("Combat mode: speed -> %.2fx", g_combatSpeed);
+                    wasCombat = true;
+                }
+            } else if (wasCombat) {
+                Log("Combat ended: resuming normal speed");
+                wasCombat = false;
+            }
+        }
+
         static float lastSpeed = 1.0f;
         if (targetSpeed != lastSpeed) {
             SetSpeed(targetSpeed);
             lastSpeed = targetSpeed;
             Log("Speed changed to %.2fx", targetSpeed);
+            if (targetSpeed == 1.0f)
+                ShowOSD("Speed: 1x (Normal)");
+            else
+                ShowOSD("Speed: %.1fx", targetSpeed);
         }
     }
 
@@ -261,8 +939,30 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     DeleteFileA(g_logPath);
 
+    // Always log startup details regardless of DebugLog setting
+    g_debugLog = true;
+    Log("=== JustSkip v1.0 starting ===");
+    Log("INI path: %s", g_iniPath);
+    Log("Log path: %s", g_logPath);
+
     LoadConfig();
-    if (!g_enabled) return TRUE;
+
+    // Resolve combat signature if configured
+    if (g_combatDetect) {
+        ResolveCombatSignature();
+    }
+
+    // Cache QPC frequency for gap detection (2 second threshold)
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    g_qpcFreq = freq.QuadPart;
+    g_gapThreshold = g_qpcFreq * 2; // 2 seconds
+    Log("QPC freq: %lld Hz, gap threshold: %lld ticks (2s)", g_qpcFreq, g_gapThreshold);
+
+    if (!g_enabled) {
+        Log("Mod disabled via INI — exiting");
+        return TRUE;
+    }
 
     if (MH_Initialize() != MH_OK) {
         Log("ERROR: MH_Initialize failed");
@@ -284,9 +984,50 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         return TRUE;
     }
 
-    Log("JustSkip loaded — QPC hook installed");
+    Log("QPC hook installed");
 
-    CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
+    // Hook XInputSetState for combat detection (vibration monitoring)
+    // Hook the GAME's XInput (may be Steam's proxy) — that's where vibration calls go
+    if (g_combatDetect) {
+        HMODULE hGameXInput = GetModuleHandleA("xinput1_4.dll");
+        if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput1_3.dll");
+        if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput9_1_0.dll");
+        if (hGameXInput) {
+            auto pfnSetState = (PFN_XInputSetState)GetProcAddress(hGameXInput, "XInputSetState");
+            if (pfnSetState) {
+                if (MH_CreateHook(pfnSetState, &HookedXInputSetState,
+                                   reinterpret_cast<LPVOID*>(&g_origXInputSetState)) == MH_OK &&
+                    MH_EnableHook(pfnSetState) == MH_OK) {
+                    Log("XInputSetState hook installed (combat detection active)");
+                } else {
+                    Log("WARNING: XInputSetState hook failed — combat detection disabled");
+                    g_combatDetect = false;
+                }
+            } else {
+                Log("WARNING: XInputSetState not found — combat detection disabled");
+                g_combatDetect = false;
+            }
+        } else {
+            Log("WARNING: No XInput DLL loaded by game — combat detection disabled");
+            g_combatDetect = false;
+        }
+    }
+
+    Log("JustSkip loaded");
+
+    // Start OSD thread first so it's ready before hotkey thread sends messages
+    if (g_osdEnabled) {
+        HANDLE hOsd = CreateThread(nullptr, 0, OsdThread, nullptr, 0, &g_osdThreadId);
+        if (hOsd) {
+            // Wait briefly for the OSD window to be created
+            for (int i = 0; i < 50 && !g_osdWnd; i++) Sleep(10);
+            CloseHandle(hOsd);
+            Log("OSD thread started (tid=%lu)", g_osdThreadId);
+        }
+    }
+
+    HANDLE hHotkey = CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
+    if (hHotkey) CloseHandle(hHotkey);
 
     return TRUE;
 }

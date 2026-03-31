@@ -4,84 +4,65 @@
 
 --- SHORT DESCRIPTION (paste into the "Summary" field) ---
 
-Hotkey-driven game speed control. Toggle 1.2x/2x/4x or hold for 12x burst. Skip slow animations, cutscenes, travel, and crafting. ASI plugin — no Cheat Engine needed.
+Customizable game speed control. Toggle 1.2x / 2x / 4x or hold for 12x burst. Keyboard and gamepad. No Cheat Engine needed.
 
 --- DESCRIPTION (copy everything below this line into the "Description" field) ---
 
-[size=4][b]JustSkip[/b] — Game Speed Control for Crimson Desert[/size]
-[size=2]by wealdly[/size]
-
-Skip through slow animations, long cutscenes, tedious crafting, and endless travel with customizable hotkeys. Toggle or hold to speed up — release to return to normal.
-
-[b]No Cheat Engine required.[/b] Standalone ASI plugin, lightweight (~24 KB), fully configurable via INI.
-
-[size=3][b]Default Hotkeys[/b][/size]
-
+[center][size=4][b]JustSkip[/b][/size]
+[size=2][color=#999999]Game speed control for Crimson Desert[/color][/size][/center]
+Toggle or hold a hotkey to speed up the game. Release to return to normal.
+Fully configurable, supports keyboard and XInput gamepad. No Cheat Engine required.
+[line]
+[size=3][b]Hotkeys[/b][/size]
+[b]Keyboard[/b]
 [list]
-[*][b]F7[/b] — Toggle 1.2x (subtle everyday speedup, barely noticeable but everything feels snappier)
-[*][b]F8[/b] — Toggle 2x (travel, looting, cooking)
-[*][b]F9[/b] — Toggle 4x (cutscenes, long crafting, waiting)
-[*][b]F10[/b] — Hold 12x (blast through anything while held)
-[*][b]F6[/b] — Reload config (edit INI mid-game, press F6 to apply)
+[*][b]F7[/b] — 1.2x toggle [color=#999999]· subtle always-on speedup[/color]
+[*][b]F8[/b] — 2x toggle [color=#999999]· travel, looting[/color]
+[*][b]F9[/b] — 4x toggle [color=#999999]· cutscenes, crafting[/color]
+[*][b]F10[/b] — 12x hold [color=#999999]· blast through anything[/color]
+[*][b]F6[/b] — reload config
 [/list]
-
-Toggle keys are mutually exclusive — pressing one deactivates the others. Press the same key again to return to normal speed. Hold key (F10) overrides any active toggle while held.
-
-[size=3][b]Fully Configurable[/b][/size]
-
-Edit [font=Courier New]JustSkip.ini[/font] to:
+[b]Gamepad[/b] [color=#999999](hold Back/View + button)[/color]
 [list]
-[*]Change any hotkey to any key
-[*]Adjust speed multipliers (1.1x, 1.5x, 3x, 100x — whatever you want)
-[*]Switch between toggle and hold mode per slot
-[*]Add up to 6 speed slots
-[*]Hot-reload changes with F6 — no restart needed
+[*]Back + D-pad Up — 1.2x toggle
+[*]Back + D-pad Left — 2x toggle
+[*]Back + D-pad Down — 4x toggle
+[*]Back + D-pad Right — 12x hold
+[*]Back + Start — reload config
 [/list]
-
-[size=3][b]Requirements[/b][/size]
-
-[b][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url][/b] — required for loading ASI plugins.
-
-If you don't already have [font=Courier New]winmm.dll[/font] in your [font=Courier New]bin64/[/font] folder:
+[color=#999999]Toggles are mutually exclusive. Hold overrides any active toggle while pressed.[/color]
+[line]
+[size=3][b]Configuration[/b][/size]
+Edit [font=Courier New]JustSkip.ini[/font] to change hotkeys, speeds, toggle/hold modes, and gamepad bindings.
+Up to 6 speed slots. Press F6 to hot-reload — no restart needed.
+[line]
+[size=3][b]Installation[/b][/size]
+[b]Requires:[/b] [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] (x64)
+If you don't have an ASI loader yet:
 [list=1]
-[*]Go to the [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/latest]latest release[/url] (v9.7.0 or newer)
-[*]Download [b]Ultimate-ASI-Loader_x64.zip[/b] (the x64 version — Crimson Desert is 64-bit)
-[*]Extract it — you'll get a single DLL (e.g. [font=Courier New]dinput8.dll[/font])
-[*][b]Rename[/b] it to [font=Courier New]winmm.dll[/font]
-[*]Place [font=Courier New]winmm.dll[/font] into your Crimson Desert [font=Courier New]bin64/[/font] folder
+[*]Download [b]Ultimate-ASI-Loader_x64.zip[/b] from the [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/latest]latest release[/url]
+[*]Rename the DLL to [font=Courier New]winmm.dll[/font]
+[*]Place it in your Crimson Desert [font=Courier New]bin64/[/font] folder
 [/list]
-If another mod already placed a [font=Courier New]winmm.dll[/font] there, you're good — skip this step.
-
-[size=3][b]Installation (recommended)[/b][/size]
-
+[b]Manual[/b] [color=#999999](recommended)[/color]
 [list=1]
-[*]Download the Manual version
-[*]Extract both files ([font=Courier New]JustSkip.asi[/font] + [font=Courier New]JustSkip.ini[/font]) into your Crimson Desert [font=Courier New]bin64/[/font] folder
+[*]Extract [font=Courier New]JustSkip.asi[/font] and [font=Courier New]JustSkip.ini[/font] into [font=Courier New]bin64/[/font]
+[*]Launch the game — press F8 to verify
 [/list]
-That's it. Launch the game.
-
-[size=3][b]Alternative: JSON Mod Manager[/b][/size]
-
-[i]Note: JSON Mod Manager can be buggy. Manual install above is recommended.[/i]
-
-Requires [url=https://www.nexusmods.com/crimsondesert/mods/113]JSON Mod Manager[/url] by PhorgeForge.
+[b]CDUMM[/b] [color=#999999](drag-and-drop mod manager)[/color]
 [list=1]
-[*]Download the CDMM version
-[*]Extract the [font=Courier New]_asi[/font] folder into your JSON Mod Manager [font=Courier New]mods/[/font] directory
-[*]Open JSON Mod Manager — JustSkip appears in ASI mods
-[*]Enable and Apply
+[*]Drag the CDUMM zip onto the [url=https://www.nexusmods.com/crimsondesert/mods/207]CDUMM[/url] window
+[*]Enable in the ASI Plugins tab and apply
 [/list]
-
-[size=3][b]Patch-Proof[/b][/size]
-
-This mod hooks a Windows API function (QueryPerformanceCounter), not game code. It will survive game updates — no need to wait for compatibility patches.
-
+[b]CDMM[/b] [color=#999999](JSON Mod Manager)[/color]
+[list=1]
+[*]Extract the [font=Courier New]_asi[/font] folder into your CDMM [font=Courier New]mods/[/font] directory
+[*]Enable and apply
+[/list]
+[line]
+[size=3][b]How It Works[/b][/size]
+Hooks [font=Courier New]QueryPerformanceCounter[/font] to scale the game's perception of time. No game code is modified — [b]survives patches[/b].
 [size=3][b]Troubleshooting[/b][/size]
-
-Set [font=Courier New]DebugLog=1[/font] in the INI to generate a log file. Check that the ASI loader is present and the log shows "QPC hook installed".
-
-[size=3][b]Source Code[/b][/size]
-
-Open source on GitHub: [url=https://github.com/wealdly/JustSkip]github.com/wealdly/JustSkip[/url]
-
-[size=2]Uses [url=https://github.com/TsudaKageyu/minhook]MinHook[/url] (BSD-2-Clause)[/size]
+Set [font=Courier New]DebugLog=1[/font] in the INI. Check the generated log for "QPC hook installed".
+[line]
+[center][size=2][color=#999999]Open source: [url=https://github.com/wealdly/JustSkip]github.com/wealdly/JustSkip[/url] · Uses [url=https://github.com/TsudaKageyu/minhook]MinHook[/url] (BSD-2-Clause)[/color][/size][/center]

@@ -3,3 +3,5 @@ release/
 *.log
 CMakeCache.txt
 CMakeFiles/
+.vscode/
+*.code-workspace
