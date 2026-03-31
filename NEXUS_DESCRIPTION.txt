@@ -1,0 +1,67 @@
+# Nexus Mods Description — JustSkip
+
+## Summary (short description field)
+Hotkey-driven game speed control. Toggle 1.2x/2x/4x or hold for 12x burst. Skip slow animations, cutscenes, travel, and crafting. ASI plugin — no Cheat Engine needed.
+
+## Description (BBCode for Nexus Mods)
+
+[size=4][b]JustSkip[/b] — Game Speed Control for Crimson Desert[/size]
+[size=2]by wealdly[/size]
+
+Skip through slow animations, long cutscenes, tedious crafting, and endless travel with customizable hotkeys. Toggle or hold to speed up — release to return to normal.
+
+[b]No Cheat Engine required.[/b] Standalone ASI plugin, lightweight (~24 KB), fully configurable via INI.
+
+[size=3][b]Default Hotkeys[/b][/size]
+
+[list]
+[*][b]F7[/b] — Toggle 1.2x (subtle everyday speedup, barely noticeable but everything feels snappier)
+[*][b]F8[/b] — Toggle 2x (travel, looting, cooking)
+[*][b]F9[/b] — Toggle 4x (cutscenes, long crafting, waiting)
+[*][b]F10[/b] — Hold 12x (blast through anything while held)
+[*][b]F6[/b] — Reload config (edit INI mid-game, press F6 to apply)
+[/list]
+
+Toggle keys are mutually exclusive — pressing one deactivates the others. Press the same key again to return to normal speed. Hold key (F10) overrides any active toggle while held.
+
+[size=3][b]Fully Configurable[/b][/size]
+
+Edit [font=Courier New]JustSkip.ini[/font] to:
+[list]
+[*]Change any hotkey to any key
+[*]Adjust speed multipliers (1.1x, 1.5x, 3x, 100x — whatever you want)
+[*]Switch between toggle and hold mode per slot
+[*]Add up to 6 speed slots
+[*]Hot-reload changes with F6 — no restart needed
+[/list]
+
+[size=3][b]Installation[/b][/size]
+
+[b]JSON Mod Manager (recommended):[/b]
+[list=1]
+[*]Download the CDMM version
+[*]Extract the [font=Courier New]_asi[/font] folder into your JSON Mod Manager [font=Courier New]mods/[/font] directory
+[*]Open JSON Mod Manager — JustSkip appears in ASI mods
+[*]Enable and Apply
+[/list]
+
+[b]Manual Install:[/b]
+[list=1]
+[*]Download the Manual version
+[*]Extract both files ([font=Courier New]JustSkip.asi[/font] + [font=Courier New]JustSkip.ini[/font]) into your Crimson Desert [font=Courier New]bin64/[/font] folder
+[*]Requires an ASI loader already present (winmm.dll or version.dll)
+[/list]
+
+[size=3][b]Patch-Proof[/b][/size]
+
+This mod hooks a Windows API function (QueryPerformanceCounter), not game code. It will survive game updates — no need to wait for compatibility patches.
+
+[size=3][b]Troubleshooting[/b][/size]
+
+Set [font=Courier New]DebugLog=1[/font] in the INI to generate a log file. Check that the ASI loader is present and the log shows "QPC hook installed".
+
+[size=3][b]Source Code[/b][/size]
+
+Open source on GitHub: [url=https://github.com/wealdly/JustSkip]github.com/wealdly/JustSkip[/url]
+
+[size=2]Uses [url=https://github.com/TsudaKageyu/minhook]MinHook[/url] (BSD-2-Clause)[/size]

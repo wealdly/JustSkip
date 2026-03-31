@@ -1,0 +1,5 @@
+build/
+release/
+*.log
+CMakeCache.txt
+CMakeFiles/
