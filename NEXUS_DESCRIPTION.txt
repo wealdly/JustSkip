@@ -1,9 +1,12 @@
-# Nexus Mods Description — JustSkip
+================================================================================
+  NEXUS MODS — JustSkip
+================================================================================
 
-## Summary (short description field)
+--- SHORT DESCRIPTION (paste into the "Summary" field) ---
+
 Hotkey-driven game speed control. Toggle 1.2x/2x/4x or hold for 12x burst. Skip slow animations, cutscenes, travel, and crafting. ASI plugin — no Cheat Engine needed.
 
-## Description (BBCode for Nexus Mods)
+--- DESCRIPTION (copy everything below this line into the "Description" field) ---
 
 [size=4][b]JustSkip[/b] — Game Speed Control for Crimson Desert[/size]
 [size=2]by wealdly[/size]
