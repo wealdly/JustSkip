@@ -63,12 +63,6 @@ static BYTE*      g_combatFlagAddr  = nullptr; // resolved ptr to game's combat 
 static char       g_combatSigPattern[512] = {}; // AOB pattern from INI
 static int        g_combatSigOffset = 0;        // offset from pattern match to flag
 
-// Auto-reset: reset toggle speed on load transitions
-static bool       g_resetOnLoad     = false;     // default OFF = toggles persist always
-
-// Load-transition signal: set by QPC gap path, consumed by hotkey thread
-static std::atomic<bool> g_loadTransitionDetected{false};
-
 // Hold-key safety
 static DWORD      g_maxHoldMs       = 120000;   // max continuous hold before force-release
 static bool       g_holdFocusCheck  = true;      // release holds when game not foreground
@@ -81,6 +75,10 @@ static int        g_osdPosX         = 20;        // offset from top-left of game
 static int        g_osdPosY         = 20;
 static HWND       g_osdWnd          = nullptr;
 static DWORD      g_osdThreadId     = 0;
+
+// Startup grace period — ignore speed changes while game initializes
+static DWORD      g_startupGraceMs  = 5000;    // ms after hook install before allowing speed
+static DWORD      g_hookInstalledAt = 0;        // tick when QPC hook went live
 
 // ---------------------------------------------------------------------------
 //  Logging
@@ -169,7 +167,9 @@ static void LoadConfig() {
     // Hold-key safety
     g_maxHoldMs    = (DWORD)ReadIniInt("Settings", "MaxHoldSeconds", 120) * 1000;
     g_holdFocusCheck = ReadIniInt("Settings", "HoldFocusCheck", 1) != 0;
-    Log("Hold safety: maxHold=%lus focusCheck=%d", g_maxHoldMs / 1000, g_holdFocusCheck);
+    g_startupGraceMs = (DWORD)ReadIniInt("Settings", "StartupGraceSeconds", 5) * 1000;
+    Log("Hold safety: maxHold=%lus focusCheck=%d startupGrace=%lus",
+        g_maxHoldMs / 1000, g_holdFocusCheck, g_startupGraceMs / 1000);
 
     // OSD (on-screen display)
     g_osdEnabled  = ReadIniInt("OSD", "Enabled", 1) != 0;
@@ -179,10 +179,6 @@ static void LoadConfig() {
     g_osdPosY     = ReadIniInt("OSD", "PosY", 20);
     Log("OSD: %s, duration=%lums, font=%d, pos=(%d,%d)",
         g_osdEnabled ? "ON" : "OFF", g_osdDuration, g_osdFontSize, g_osdPosX, g_osdPosY);
-
-    // Auto-reset on load transitions
-    g_resetOnLoad = ReadIniInt("AutoReset", "ResetOnLoad", 0) != 0;
-    Log("AutoReset: onLoad=%d", g_resetOnLoad);
 
     // Read speed slots — up to 6 sections named Speed1..Speed6
     g_slotCount = 0;
@@ -391,7 +387,6 @@ static LARGE_INTEGER g_fakeBase   = {};
 static double        g_curSpeed   = 1.0;
 static bool          g_timeInited = false;
 static LONGLONG      g_qpcFreq    = 0;     // cached QPC frequency
-static LONGLONG      g_gapThreshold = 0;   // max real delta before reset (2s)
 
 static void SetSpeed(double speed) {
     AcquireSRWLockExclusive(&g_timeLock);
@@ -401,16 +396,8 @@ static void SetSpeed(double speed) {
 
     if (g_timeInited) {
         LONGLONG realDelta = realNow.QuadPart - g_realBase.QuadPart;
-        LONGLONG threshold = (g_curSpeed > 1.0)
-            ? (LONGLONG)(g_gapThreshold / g_curSpeed) : g_gapThreshold;
-        if (realDelta > 0 && realDelta < threshold) {
+        if (realDelta > 0)
             g_fakeBase.QuadPart += (LONGLONG)((double)realDelta * g_curSpeed);
-        } else {
-            // Gap too large — pass through at 1:1 to avoid time explosion
-            g_fakeBase.QuadPart += realDelta;
-            Log("SetSpeed: gap reset (delta=%lld ticks, %.2fs)",
-                realDelta, g_qpcFreq ? (double)realDelta / g_qpcFreq : 0.0);
-        }
     } else {
         g_fakeBase = realNow;
         g_timeInited = true;
@@ -428,13 +415,12 @@ static BOOL WINAPI HookedQPC(LARGE_INTEGER* lpCounter) {
     LARGE_INTEGER realNow;
     g_origQPC(&realNow);
 
-    // Fast shared path — covers 99%+ of calls (no writes to shared state)
     AcquireSRWLockShared(&g_timeLock);
 
     if (!g_timeInited) {
         ReleaseSRWLockShared(&g_timeLock);
         AcquireSRWLockExclusive(&g_timeLock);
-        if (!g_timeInited) {            // double-check after upgrade
+        if (!g_timeInited) {
             g_realBase = realNow;
             g_fakeBase = realNow;
             g_timeInited = true;
@@ -445,40 +431,15 @@ static BOOL WINAPI HookedQPC(LARGE_INTEGER* lpCounter) {
     }
 
     LONGLONG realDelta = realNow.QuadPart - g_realBase.QuadPart;
-
-    // Scale threshold inversely with speed so the max *fake-time* jump stays
-    // capped at ~2 s regardless of multiplier.  At 12×, a real 0.17 s pause
-    // already produces a 2 s fake jump — anything longer is a load transition.
     double speed = g_curSpeed;
-    LONGLONG threshold = (speed > 1.0) ? (LONGLONG)(g_gapThreshold / speed)
-                                       : g_gapThreshold;
 
-    if (realDelta > 0 && realDelta < threshold) {
-        // Common path: pure read — multiple threads can execute concurrently
+    if (realDelta > 0) {
         lpCounter->QuadPart = g_fakeBase.QuadPart + (LONGLONG)((double)realDelta * speed);
-        ReleaseSRWLockShared(&g_timeLock);
     } else {
-        // Gap path (load screen / transition) — needs exclusive to reset base
-        ReleaseSRWLockShared(&g_timeLock);
-        AcquireSRWLockExclusive(&g_timeLock);
-        g_origQPC(&realNow);  // re-sample after lock upgrade
-        speed = g_curSpeed;   // re-read after lock upgrade
-        threshold = (speed > 1.0) ? (LONGLONG)(g_gapThreshold / speed)
-                                  : g_gapThreshold;
-        realDelta = realNow.QuadPart - g_realBase.QuadPart;
-        if (realDelta > 0 && realDelta < threshold) {
-            lpCounter->QuadPart = g_fakeBase.QuadPart + (LONGLONG)((double)realDelta * speed);
-        } else {
-            g_fakeBase.QuadPart += realDelta;
-            g_realBase = realNow;
-            lpCounter->QuadPart = g_fakeBase.QuadPart;
-            // Signal hotkey thread that a load transition occurred
-            if (g_resetOnLoad)
-                g_loadTransitionDetected.store(true, std::memory_order_relaxed);
-        }
-        ReleaseSRWLockExclusive(&g_timeLock);
+        lpCounter->QuadPart = g_fakeBase.QuadPart;
     }
 
+    ReleaseSRWLockShared(&g_timeLock);
     return TRUE;
 }
 
@@ -723,21 +684,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             reloadDown = false;
         }
 
-        // --- Auto-reset on load transition ---
-        if (g_loadTransitionDetected.exchange(false, std::memory_order_relaxed)) {
-            bool anyToggleWasActive = false;
-            for (int i = 0; i < g_slotCount; i++) {
-                if (!g_slots[i].isHold && g_slots[i].active) {
-                    anyToggleWasActive = true;
-                    g_slots[i].active = false;
-                }
-            }
-            if (anyToggleWasActive) {
-                SetSpeed(1.0);
-                Log("AutoReset: load transition detected — toggles reset to 1x");
-                ShowOSD("Speed: 1x (Load Reset)");
-            }
-        }
+        DWORD now = GetTickCount();
 
         float targetSpeed = 1.0f;
         bool anyHoldActive = false;
@@ -753,7 +700,9 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             }
         }
 
-        DWORD now = GetTickCount();
+        // --- Startup grace period: ignore speed changes while game initializes ---
+        bool inGrace = g_hookInstalledAt && g_startupGraceMs &&
+                       (now - g_hookInstalledAt) < g_startupGraceMs;
 
         // --- Hold keys take priority (keyboard + gamepad) ---
         for (int i = 0; i < g_slotCount; i++) {
@@ -910,6 +859,9 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             }
         }
 
+        // --- Apply speed (skip during startup grace period) ---
+        if (inGrace) targetSpeed = 1.0f;
+
         static float lastSpeed = 1.0f;
         if (targetSpeed != lastSpeed) {
             SetSpeed(targetSpeed);
@@ -953,17 +905,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     LoadConfig();
 
+    // Keep logging through startup, then respect INI setting
+    bool userDebug = g_debugLog;
+    g_debugLog = true;
+
     // Resolve combat signature if configured
     if (g_combatDetect) {
         ResolveCombatSignature();
     }
 
-    // Cache QPC frequency for gap detection (2 second threshold)
+    // Cache QPC frequency
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     g_qpcFreq = freq.QuadPart;
-    g_gapThreshold = g_qpcFreq * 2; // 2 seconds
-    Log("QPC freq: %lld Hz, gap threshold: %lld ticks (2s)", g_qpcFreq, g_gapThreshold);
+    Log("QPC freq: %lld Hz", g_qpcFreq);
 
     if (!g_enabled) {
         Log("Mod disabled via INI — exiting");
@@ -991,6 +946,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     }
 
     Log("QPC hook installed");
+    g_hookInstalledAt = GetTickCount();
 
     // Hook XInputSetState for combat detection (vibration monitoring)
     // Hook the GAME's XInput (may be Steam's proxy) — that's where vibration calls go
@@ -1020,6 +976,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     }
 
     Log("JustSkip loaded");
+
+    // Restore user's DebugLog preference now that startup logging is complete
+    g_debugLog = userDebug;
 
     // Start OSD thread first so it's ready before hotkey thread sends messages
     if (g_osdEnabled) {

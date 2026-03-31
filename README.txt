@@ -23,7 +23,7 @@ DEFAULT HOTKEYS
   F7              D-pad Up                Toggle      1.2x
   F8              D-pad Left              Toggle      2x
   F9              D-pad Down              Toggle      4x
-  F10             D-pad Right             Hold        12x
+  F10             D-pad Right             Hold        8x
   F6              Start                   —           Reload config
 
   Why Back/View as modifier? Least disruptive during cutscenes — the primary

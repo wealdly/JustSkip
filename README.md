@@ -18,7 +18,7 @@ Toggle or hold a hotkey to speed up the game. Fully configurable, supports keybo
 | F7 | D-pad Up | Toggle | 1.2x |
 | F8 | D-pad Left | Toggle | 2x |
 | F9 | D-pad Down | Toggle | 4x |
-| F10 | D-pad Right | Hold | 12x |
+| F10 | D-pad Right | Hold | 8x |
 | F6 | Start | — | Reload config |
 
 Why Back/View as modifier? Least disruptive during cutscenes — the primary use case for speed control. XInput is read directly from System32, bypassing Steam Input entirely.
