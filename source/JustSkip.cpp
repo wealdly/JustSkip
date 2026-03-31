@@ -40,6 +40,7 @@ static SpeedSlot  g_slots[6];
 static int        g_slotCount  = 0;
 static bool       g_enabled    = true;
 static int        g_reloadKey  = 0;
+static bool       g_gamepadEnabled    = true;  // master toggle for all gamepad functionality
 static WORD       g_gamepadModifier   = 0;  // XInput buttons that must be held
 static WORD       g_gamepadReloadBtn  = 0;  // XInput button for reload (with modifier)
 static int        g_gamepadIndex      = 0;  // Controller index 0-3
@@ -132,6 +133,7 @@ static void LoadConfig() {
     g_reloadKey = ReadIniHex("Settings", "ReloadKey", 0x00);
 
     // Gamepad settings
+    g_gamepadEnabled   = ReadIniInt("Settings", "GamepadEnabled", 1) != 0;
     g_gamepadModifier  = (WORD)ReadIniHex("Settings", "GamepadModifier", 0x0000);
     g_gamepadReloadBtn = (WORD)ReadIniHex("Settings", "GamepadReloadButton", 0x0000);
     g_gamepadIndex     = ReadIniInt("Settings", "GamepadIndex", 0);
@@ -161,8 +163,8 @@ static void LoadConfig() {
     if (g_combatSigPattern[0])
         Log("  SignaturePattern: %s (offset=%d)", g_combatSigPattern, g_combatSigOffset);
 
-    Log("Gamepad: modifier=0x%04X reload=0x%04X index=%d",
-        g_gamepadModifier, g_gamepadReloadBtn, g_gamepadIndex);
+    Log("Gamepad: %s, modifier=0x%04X reload=0x%04X index=%d",
+        g_gamepadEnabled ? "ON" : "OFF", g_gamepadModifier, g_gamepadReloadBtn, g_gamepadIndex);
 
     // Hold-key safety
     g_maxHoldMs    = (DWORD)ReadIniInt("Settings", "MaxHoldSeconds", 120) * 1000;
@@ -623,9 +625,13 @@ static void ShowOSD(const char* fmt, ...) {
 static DWORD WINAPI HotkeyThread(LPVOID) {
     Log("Hotkey thread started");
 
-    if (g_gamepadModifier != 0) {
+    if (g_gamepadEnabled && g_gamepadModifier != 0) {
         LoadXInput();
         g_detectedPadIndex = g_gamepadIndex > 0 ? g_gamepadIndex : -1;
+        if (g_xinputLoaded)
+            Log("Gamepad support active — scanning for controllers");
+    } else {
+        Log("Gamepad disabled — keyboard only");
     }
 
     bool prevDown[6] = {};
@@ -646,7 +652,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         BYTE padLeftTrigger = 0;
         bool padConnected = false;
 
-        if (g_xinputLoaded && g_gamepadModifier != 0) {
+        if (g_gamepadEnabled && g_xinputLoaded && g_gamepadModifier != 0) {
             DWORD now = GetTickCount();
             bool shouldPoll = padWasConnected || (now - lastPadAttempt >= 2000);
             if (shouldPoll) {
@@ -988,7 +994,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Hook XInputSetState for combat detection (vibration monitoring)
     // Hook the GAME's XInput (may be Steam's proxy) — that's where vibration calls go
-    if (g_combatDetect) {
+    if (g_combatDetect && g_gamepadEnabled) {
         HMODULE hGameXInput = GetModuleHandleA("xinput1_4.dll");
         if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput1_3.dll");
         if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput9_1_0.dll");

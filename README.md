@@ -68,12 +68,13 @@ Speed=1.2
 **Gamepad:**
 ```ini
 [Settings]
-GamepadModifier=0020     ; Back/View (hold first)
-GamepadReloadButton=0010 ; Start (with modifier)
-GamepadIndex=0           ; Controller 0-3
+GamepadEnabled=1           ; 0 = keyboard only (skips XInput entirely)
+GamepadModifier=0020       ; Back/View (hold first)
+GamepadReloadButton=0010   ; Start (with modifier)
+GamepadIndex=0             ; Controller 0-3
 ```
 
-Set `GamepadModifier=0000` to disable gamepad entirely.
+Set `GamepadEnabled=0` to disable all gamepad functionality (no XInput loading or polling).
 Set a slot's `GamepadButton=0000` to disable its gamepad binding.
 
 ## Combat Detection (optional)
