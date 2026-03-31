@@ -35,22 +35,38 @@ Edit [font=Courier New]JustSkip.ini[/font] to:
 [*]Hot-reload changes with F6 — no restart needed
 [/list]
 
-[size=3][b]Installation[/b][/size]
+[size=3][b]Requirements[/b][/size]
 
-[b]JSON Mod Manager (recommended):[/b]
+[b][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url][/b] — required for loading ASI plugins.
+
+If you don't already have [font=Courier New]winmm.dll[/font] in your [font=Courier New]bin64/[/font] folder:
+[list=1]
+[*]Go to the [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/latest]latest release[/url] (v9.7.0 or newer)
+[*]Download [b]Ultimate-ASI-Loader_x64.zip[/b] (the x64 version — Crimson Desert is 64-bit)
+[*]Extract it — you'll get a single DLL (e.g. [font=Courier New]dinput8.dll[/font])
+[*][b]Rename[/b] it to [font=Courier New]winmm.dll[/font]
+[*]Place [font=Courier New]winmm.dll[/font] into your Crimson Desert [font=Courier New]bin64/[/font] folder
+[/list]
+If another mod already placed a [font=Courier New]winmm.dll[/font] there, you're good — skip this step.
+
+[size=3][b]Installation (recommended)[/b][/size]
+
+[list=1]
+[*]Download the Manual version
+[*]Extract both files ([font=Courier New]JustSkip.asi[/font] + [font=Courier New]JustSkip.ini[/font]) into your Crimson Desert [font=Courier New]bin64/[/font] folder
+[/list]
+That's it. Launch the game.
+
+[size=3][b]Alternative: JSON Mod Manager[/b][/size]
+
+[i]Note: JSON Mod Manager can be buggy. Manual install above is recommended.[/i]
+
 Requires [url=https://www.nexusmods.com/crimsondesert/mods/113]JSON Mod Manager[/url] by PhorgeForge.
 [list=1]
 [*]Download the CDMM version
 [*]Extract the [font=Courier New]_asi[/font] folder into your JSON Mod Manager [font=Courier New]mods/[/font] directory
 [*]Open JSON Mod Manager — JustSkip appears in ASI mods
 [*]Enable and Apply
-[/list]
-
-[b]Manual Install:[/b]
-Requires [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] — download the [font=Courier New]winmm.dll[/font] version and place it in your [font=Courier New]bin64/[/font] folder if you don't already have one.
-[list=1]
-[*]Download the Manual version
-[*]Extract both files ([font=Courier New]JustSkip.asi[/font] + [font=Courier New]JustSkip.ini[/font]) into your Crimson Desert [font=Courier New]bin64/[/font] folder
 [/list]
 
 [size=3][b]Patch-Proof[/b][/size]
