@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.2 — 2026-03-31
+## v2.3 — 2026-03-31
 
 ### Changed
 - Gamepad bindings are now all toggles: Back + X (1.2x), Back + A (4x) — no more holds on gamepad

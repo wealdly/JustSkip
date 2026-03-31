@@ -1,6 +1,6 @@
 {
   "name": "JustSkip",
   "author": "wealdly",
-  "version": "2.2",
+  "version": "2.3",
   "description": "Game speed control. Toggle 1.2x/2x/4x or hold for 8x burst. Keyboard and gamepad."
 }

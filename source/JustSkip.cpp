@@ -19,7 +19,7 @@
 typedef DWORD(WINAPI* PFN_XInputGetState)(DWORD dwUserIndex, XINPUT_STATE* pState);
 typedef DWORD(WINAPI* PFN_XInputSetState)(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration);
 static PFN_XInputGetState g_pXInputGetState     = nullptr; // raw fn ptr for our polling
-static PFN_XInputSetState g_origXInputSetState   = nullptr; // trampoline for game's calls
+static PFN_XInputSetState g_origXInputSetState   = nullptr; // trampoline for game's SetState
 static bool               g_xinputLoaded         = false;
 static int                g_detectedPadIndex     = -1;     // auto-detected at runtime
 
@@ -901,7 +901,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Always log startup details regardless of DebugLog setting
     g_debugLog = true;
-    Log("=== JustSkip v2.2 starting ===");
+    Log("=== JustSkip v2.3 starting ===");
     Log("INI path: %s", g_iniPath);
     Log("Log path: %s", g_logPath);
 
@@ -951,30 +951,32 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     Log("QPC hook installed");
     g_hookInstalledAt = GetTickCount();
 
-    // Hook XInputSetState for combat detection (vibration monitoring)
-    // Hook the GAME's XInput (may be Steam's proxy) — that's where vibration calls go
-    if (g_combatDetect && g_gamepadEnabled) {
+    // Hook game's XInput for combat detection (vibration monitoring)
+    if (g_gamepadEnabled) {
         HMODULE hGameXInput = GetModuleHandleA("xinput1_4.dll");
         if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput1_3.dll");
         if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput9_1_0.dll");
         if (hGameXInput) {
-            auto pfnSetState = (PFN_XInputSetState)GetProcAddress(hGameXInput, "XInputSetState");
-            if (pfnSetState) {
-                if (MH_CreateHook(pfnSetState, &HookedXInputSetState,
-                                   reinterpret_cast<LPVOID*>(&g_origXInputSetState)) == MH_OK &&
-                    MH_EnableHook(pfnSetState) == MH_OK) {
-                    Log("XInputSetState hook installed (combat detection active)");
+            // Hook SetState for combat detection (vibration monitoring)
+            if (g_combatDetect) {
+                auto pfnSetState = (PFN_XInputSetState)GetProcAddress(hGameXInput, "XInputSetState");
+                if (pfnSetState) {
+                    if (MH_CreateHook(pfnSetState, &HookedXInputSetState,
+                                       reinterpret_cast<LPVOID*>(&g_origXInputSetState)) == MH_OK &&
+                        MH_EnableHook(pfnSetState) == MH_OK) {
+                        Log("XInputSetState hook installed (combat detection active)");
+                    } else {
+                        Log("WARNING: XInputSetState hook failed — combat detection disabled");
+                        g_combatDetect = false;
+                    }
                 } else {
-                    Log("WARNING: XInputSetState hook failed — combat detection disabled");
+                    Log("WARNING: XInputSetState not found — combat detection disabled");
                     g_combatDetect = false;
                 }
-            } else {
-                Log("WARNING: XInputSetState not found — combat detection disabled");
-                g_combatDetect = false;
             }
         } else {
-            Log("WARNING: No XInput DLL loaded by game — combat detection disabled");
-            g_combatDetect = false;
+            Log("WARNING: No XInput DLL loaded by game — combat hooks skipped");
+            if (g_combatDetect) g_combatDetect = false;
         }
     }
 
