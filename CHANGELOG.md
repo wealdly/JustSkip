@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.5 — 2026-03-31
+
+### Added
+- **QPC caller bypass for frame generation** — `_ReturnAddress()` check skips time scaling for OptiScaler, FSR Frame Generation, and Streamline/DLSS-G DLLs, preventing frame generation from disabling when speed changes
+
+### Fixed
+- **Button suppression per-controller filtering** — suppression now only applies to the detected controller index, fixing false "release" events from unused indices that caused Back to bleed through
+- **Quick-tap reliability** — increased tap threshold from 150ms to 250ms and replay window from 60ms to 150ms for more consistent Back/View passthrough on quick presses
+
+## v2.4 — 2026-03-31
+
+### Added
+- **Button suppression** — hooks the game's `XInputGetState` via MinHook; when the modifier (Back/View) is held, the modifier bit and all configured speed-button bits are stripped from `wButtons` before the game sees them, preventing accidental menu opens and in-game interactions during speed combos
+- `SuppressButtons=1` INI setting (default enabled) — set to 0 to disable if needed
+- `g_inJSPoll` thread-local bypass flag ensures JustSkip's own controller polling is never filtered even if the game and JustSkip resolve to the same XInput DLL (non-Steam installs)
+
 ## v2.3 — 2026-03-31
 
 ### Changed

@@ -10,6 +10,8 @@ Toggle or hold a hotkey to speed up the game. Fully configurable, supports keybo
 - **Gamepad** — XInput with Back/View + face button combos (bypasses Steam Input)
 - **Combat detection** — optional multi-signal fusion resets speed during fights
 - **Patch-proof** — hooks QueryPerformanceCounter, not game code — survives updates
+- **Button suppression** — gamepad modifier and speed buttons are hidden from the game, preventing accidental zoom/menu activation
+- **Frame generation compatible** — QPC bypass for OptiScaler, FSR-FG, and DLSS-G keeps frame gen running during speed changes
 
 ## Default Hotkeys
 
@@ -69,8 +71,9 @@ Speed=1.2
 ```ini
 [Settings]
 GamepadEnabled=1           ; 0 = keyboard only (skips XInput entirely)
-GamepadModifier=0100       ; LB (hold first)
+GamepadModifier=0020       ; Back/View (hold first)
 GamepadIndex=0             ; Controller 0-3
+SuppressButtons=1          ; Hide modifier+speed buttons from game (prevents zoom toggle)
 ```
 
 Set `GamepadEnabled=0` to disable all gamepad functionality (no XInput loading or polling).
@@ -101,6 +104,12 @@ If the community discovers the game's in-memory combat flag, paste an AOB patter
 SignaturePattern=48 8B 05 ?? ?? ?? ?? 80 78 1A 01
 SignatureOffset=3
 ```
+
+## Compatibility
+
+- **OptiScaler / FSR Frame Generation** — fully compatible. JustSkip detects frame-generation DLLs at startup and returns unscaled QPC values to them, so frame gen stays active during speed changes.
+- **DLSS-G / Streamline** — same bypass applies to `sl.dlss_g.dll` and `sl.interposer.dll`.
+- **Other ASI mods** — no conflicts; uses standard MinHook hooking.
 
 ## Troubleshooting
 
@@ -144,7 +153,7 @@ Shift=`10` · Ctrl=`11` · Alt=`12` · Tab=`09` · Space=`20` · Esc=`1B` · Ent
 **Keyboard:** W/A/S/D, Shift, Space, Q, LMB/RMB, 1-8, R, F, V, E, I/Tab, M, J, P, H, Esc, F1-F5, F12
 **Safe:** F6-F10 (defaults), numpad, Home/End/Insert/PgUp/PgDn
 
-**Gamepad:** All face/bumper/trigger/stick buttons used in combat. LB is the default modifier — hold it first, then press the speed button.
+**Gamepad:** All face/bumper/trigger/stick buttons used in combat. Back/View is the default modifier — hold it first, then press the speed button. Button suppression prevents the game from seeing these presses.
 
 </details>
 

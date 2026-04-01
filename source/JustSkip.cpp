@@ -8,8 +8,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
+#include <intrin.h>
+#include <Psapi.h>
 
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "psapi.lib")
 
 #include "MinHook.h"
 
@@ -22,6 +25,13 @@ static PFN_XInputGetState g_pXInputGetState     = nullptr; // raw fn ptr for our
 static PFN_XInputSetState g_origXInputSetState   = nullptr; // trampoline for game's SetState
 static bool               g_xinputLoaded         = false;
 static int                g_detectedPadIndex     = -1;     // auto-detected at runtime
+static PFN_XInputGetState g_origXInputGetState   = nullptr; // MinHook trampoline for game's GetState
+static PFN_XInputGetState g_origXInputGetStateEx  = nullptr; // MinHook trampoline for game's GetStateEx (ordinal 100)
+static WORD               g_suppressMask         = 0;       // modifier | all slot gamepad buttons (precomputed)
+static bool               g_suppressButtons      = true;    // INI: SuppressButtons=1
+static bool               g_suppressHookFailed   = false;   // set on hook failure; prevents hot-reload re-enabling
+static thread_local bool  g_inJSPoll             = false;   // bypass: JustSkip's own polls skip the hook
+static std::atomic<WORD>  g_suppressLastLog{0};             // last stripped mask logged (dedup, written from hook thread)
 
 
 
@@ -138,6 +148,7 @@ static void LoadConfig() {
     g_gamepadReloadBtn = (WORD)ReadIniHex("Settings", "GamepadReloadButton", 0x0000);
     g_gamepadIndex     = ReadIniInt("Settings", "GamepadIndex", 0);
     if (g_gamepadIndex < 0 || g_gamepadIndex > 3) g_gamepadIndex = 0;
+    g_suppressButtons  = !g_suppressHookFailed && ReadIniInt("Settings", "SuppressButtons", 1) != 0;
 
     // Combat detection (multi-signal fusion)
     g_combatDetect    = ReadIniInt("Combat", "Enabled", 0) != 0;
@@ -210,6 +221,13 @@ static void LoadConfig() {
     }
 
     Log("Config loaded: %d slots, enabled=%d", g_slotCount, g_enabled);
+
+    // Precompute suppress mask used by HookedXInputGetState
+    g_suppressMask = g_gamepadModifier;
+    for (int i = 0; i < g_slotCount; i++)
+        g_suppressMask |= g_slots[i].gamepadButton;
+    Log("Button suppression: %s, mask=0x%04X",
+        g_suppressButtons ? "ON" : "OFF", g_suppressMask);
 }
 
 // ---------------------------------------------------------------------------
@@ -311,11 +329,16 @@ static void ResolveCombatSignature() {
 typedef DWORD(WINAPI* PFN_XInputGetStateEx)(DWORD dwUserIndex, XINPUT_STATE* pState);
 static PFN_XInputGetStateEx g_pXInputGetStateEx = nullptr;
 
-// Unified helper — prefer undocumented GetStateEx, fall back to GetState
+// Unified helper — prefer undocumented GetStateEx, fall back to GetState.
+// Sets g_inJSPoll so HookedXInputGetState skips filtering on our own polls.
 static DWORD CallXInputGetState(DWORD idx, XINPUT_STATE* pState) {
-    if (g_pXInputGetStateEx) return g_pXInputGetStateEx(idx, pState);
-    if (g_pXInputGetState)   return g_pXInputGetState(idx, pState);
-    return ERROR_DEVICE_NOT_CONNECTED;
+    g_inJSPoll = true;
+    DWORD r;
+    if (g_pXInputGetStateEx) r = g_pXInputGetStateEx(idx, pState);
+    else if (g_pXInputGetState) r = g_pXInputGetState(idx, pState);
+    else r = ERROR_DEVICE_NOT_CONNECTED;
+    g_inJSPoll = false;
+    return r;
 }
 
 // XInputSetState hook — detect vibration (combat indicator)
@@ -338,6 +361,81 @@ static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pV
     return g_origXInputSetState ? g_origXInputSetState(dwUserIndex, pVibration) : ERROR_SUCCESS;
 }
 
+// Shared suppression logic — called by both GetState and GetStateEx hooks.
+// Strategy: eat-and-replay. Back is ALWAYS stripped while held. On release:
+//   - If held < 250ms and no speed button was pressed → inject Back for ~150ms
+//     so the game registers the quick tap (zoom toggle).
+//   - If held >= 250ms OR a speed button was pressed → game never sees Back.
+static void SuppressButtons(XINPUT_STATE* pState) {
+    static DWORD s_modDownTick  = 0;   // tick when modifier was first pressed
+    static DWORD s_replayUntil  = 0;   // tick until which we inject Back after release
+    static bool  s_comboSeen    = false; // true once a speed button appeared this hold
+
+    const WORD speedMask = g_suppressMask & ~g_gamepadModifier;
+    const bool modHeld   = (pState->Gamepad.wButtons & g_gamepadModifier) == g_gamepadModifier;
+    const bool speedHeld = (pState->Gamepad.wButtons & speedMask) != 0;
+    DWORD now = GetTickCount();
+
+    // Replay phase: modifier was released quickly, inject Back for a few frames
+    if (s_replayUntil != 0) {
+        if (now <= s_replayUntil && !modHeld) {
+            pState->Gamepad.wButtons |= g_gamepadModifier;  // inject the tap
+            return;
+        }
+        s_replayUntil = 0;  // replay window expired or button re-pressed
+    }
+
+    if (!modHeld) {
+        // Modifier just released — decide whether to replay
+        if (s_modDownTick != 0 && !s_comboSeen && (now - s_modDownTick) < 250) {
+            // Quick tap, no combo — replay Back for 150ms so game sees the press
+            s_replayUntil = now + 150;
+            pState->Gamepad.wButtons |= g_gamepadModifier;  // first replay frame
+            Log("GetState hook: quick-tap replay (held %lums)", now - s_modDownTick);
+        }
+        s_modDownTick = 0;
+        s_comboSeen   = false;
+        g_suppressLastLog.store(0, std::memory_order_relaxed);
+        return;
+    }
+
+    // Modifier is held — always suppress it and any speed buttons
+    if (s_modDownTick == 0)
+        s_modDownTick = now;
+
+    if (speedHeld)
+        s_comboSeen = true;
+
+    WORD before = pState->Gamepad.wButtons;
+    pState->Gamepad.wButtons &= ~g_suppressMask;
+    WORD stripped = before & g_suppressMask;
+    WORD prev = g_suppressLastLog.exchange(stripped, std::memory_order_relaxed);
+    if (stripped != prev)
+        Log("GetState hook: stripped 0x%04X from game wButtons", stripped);
+}
+
+// XInputGetState hook (standard export + ordinal 3)
+static DWORD WINAPI HookedXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState) {
+    DWORD result = g_origXInputGetState(dwUserIndex, pState);
+    if (g_inJSPoll) return result;
+    if (result == ERROR_SUCCESS && pState &&
+        (int)dwUserIndex == g_detectedPadIndex &&
+        g_suppressButtons && g_suppressMask != 0 && g_gamepadModifier != 0)
+        SuppressButtons(pState);
+    return result;
+}
+
+// XInputGetStateEx hook (undocumented ordinal 100 — used by many games)
+static DWORD WINAPI HookedXInputGetStateEx(DWORD dwUserIndex, XINPUT_STATE* pState) {
+    DWORD result = g_origXInputGetStateEx(dwUserIndex, pState);
+    if (g_inJSPoll) return result;
+    if (result == ERROR_SUCCESS && pState &&
+        (int)dwUserIndex == g_detectedPadIndex &&
+        g_suppressButtons && g_suppressMask != 0 && g_gamepadModifier != 0)
+        SuppressButtons(pState);
+    return result;
+}
+
 static void LoadXInput() {
     // Strategy: load directly from System32 to bypass Steam's XInput wrapper.
     // Steam hooks GetModuleHandle/LoadLibrary for xinput DLLs and returns its own
@@ -352,10 +450,18 @@ static void LoadXInput() {
         char fullPath[MAX_PATH];
         sprintf_s(fullPath, "%s\\%s", sysDir, name);
 
-        // Use LOAD_LIBRARY_SEARCH_SYSTEM32 to guarantee we get the real DLL
+        // Use LOAD_WITH_ALTERED_SEARCH_PATH to guarantee we get the real DLL
         HMODULE hMod = LoadLibraryExA(fullPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (!hMod) {
-            Log("  LoadLibraryExA(%s) failed (err=%lu)", fullPath, GetLastError());
+            // Fallback: try loading by name alone (works on most systems)
+            hMod = LoadLibraryExA(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        }
+        if (!hMod) {
+            // Last resort: plain LoadLibrary
+            hMod = LoadLibraryA(fullPath);
+        }
+        if (!hMod) {
+            Log("  XInput: %s not found (err=%lu)", name, GetLastError());
             continue;
         }
 
@@ -374,7 +480,78 @@ static void LoadXInput() {
         }
         FreeLibrary(hMod);
     }
-    Log("WARNING: Could not load any XInput DLL from System32 — gamepad support disabled");
+    Log("WARNING: Could not load any XInput DLL from System32");
+
+    // Fallback: use whatever XInput the game already loaded (may be Steam's wrapper,
+    // but better than no gamepad support at all)
+    for (auto name : dllNames) {
+        HMODULE hMod = GetModuleHandleA(name);
+        if (!hMod) continue;
+
+        auto pfnEx = (PFN_XInputGetStateEx)GetProcAddress(hMod, MAKEINTRESOURCEA(100));
+        auto pfn = (PFN_XInputGetState)GetProcAddress(hMod, "XInputGetState");
+        if (!pfn) pfn = (PFN_XInputGetState)GetProcAddress(hMod, MAKEINTRESOURCEA(3));
+
+        if (pfn || pfnEx) {
+            g_pXInputGetState   = pfn;
+            g_pXInputGetStateEx = pfnEx;
+            g_xinputLoaded = true;
+            Log("XInput fallback: using game's %s (%s)", name, pfnEx ? "GetStateEx" : "GetState");
+            return;
+        }
+    }
+    Log("WARNING: No XInput DLL available — gamepad support disabled");
+}
+
+// ---------------------------------------------------------------------------
+//  QPC caller bypass — let frame-generation DLLs see real (unscaled) time
+// ---------------------------------------------------------------------------
+struct ModuleRange {
+    uintptr_t base;
+    uintptr_t end;
+};
+static ModuleRange g_bypassModules[16] = {};
+static int         g_bypassCount       = 0;
+
+static void CacheBypassModule(const char* name) {
+    if (g_bypassCount >= 16) return;
+    HMODULE hMod = GetModuleHandleA(name);
+    if (!hMod) return;
+    MODULEINFO mi = {};
+    if (GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi))) {
+        g_bypassModules[g_bypassCount].base = (uintptr_t)mi.lpBaseOfDll;
+        g_bypassModules[g_bypassCount].end  = (uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage;
+        g_bypassCount++;
+        Log("QPC bypass: %s [0x%llX - 0x%llX]", name,
+            (unsigned long long)g_bypassModules[g_bypassCount-1].base,
+            (unsigned long long)g_bypassModules[g_bypassCount-1].end);
+    }
+}
+
+static void CacheBypassModules() {
+    g_bypassCount = 0;
+    // OptiScaler / FSR frame generation modules
+    CacheBypassModule("version.dll");                             // OptiScaler proxy
+    CacheBypassModule("OptiScaler.dll");                          // alternate name
+    CacheBypassModule("amd_fidelityfx_framegeneration_dx12.dll"); // FSR FG
+    CacheBypassModule("amd_fidelityfx_dx12.dll");                 // FSR core
+    // Streamline / DLSS-G frame generation
+    CacheBypassModule("sl.dlss_g.dll");
+    CacheBypassModule("sl.common.dll");
+    CacheBypassModule("sl.interposer.dll");
+    // d3d12core.dll is OptiScaler's proxy in the d3d12/ subfolder
+    CacheBypassModule("d3d12core.dll");
+    Log("QPC bypass: %d modules cached", g_bypassCount);
+}
+
+static __forceinline bool IsCallerBypassed() {
+    void* retAddr = _ReturnAddress();
+    uintptr_t addr = (uintptr_t)retAddr;
+    for (int i = 0; i < g_bypassCount; i++) {
+        if (addr >= g_bypassModules[i].base && addr < g_bypassModules[i].end)
+            return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +593,12 @@ static BOOL WINAPI HookedQPC(LARGE_INTEGER* lpCounter) {
 
     LARGE_INTEGER realNow;
     g_origQPC(&realNow);
+
+    // Let frame-generation DLLs see real unscaled time
+    if (g_bypassCount > 0 && IsCallerBypassed()) {
+        *lpCounter = realNow;
+        return TRUE;
+    }
 
     AcquireSRWLockShared(&g_timeLock);
 
@@ -459,10 +642,23 @@ static void OSD_Paint(HWND hwnd) {
     strncpy_s(text, g_osdText, _TRUNCATE);
     if (text[0] == '\0') { ShowWindow(hwnd, SW_HIDE); return; }
 
-    // Find game window to position relative to it
-    HWND gameWnd = GetForegroundWindow();
+    // Find game window by PID (GetForegroundWindow is unreliable during loading screens)
     RECT gameRect = {};
-    if (gameWnd) GetWindowRect(gameWnd, &gameRect);
+    DWORD myPid = GetCurrentProcessId();
+    HWND gameWnd = nullptr;
+    HWND candidate = nullptr;
+    while ((candidate = FindWindowExA(nullptr, candidate, nullptr, nullptr)) != nullptr) {
+        DWORD wndPid = 0;
+        GetWindowThreadProcessId(candidate, &wndPid);
+        if (wndPid == myPid && IsWindowVisible(candidate) && candidate != hwnd) {
+            RECT r;
+            if (GetWindowRect(candidate, &r) && (r.right - r.left) > 400) {
+                gameWnd = candidate;
+                gameRect = r;
+                break;
+            }
+        }
+    }
 
     HDC screenDC = GetDC(nullptr);
     HDC memDC = CreateCompatibleDC(screenDC);
@@ -901,7 +1097,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Always log startup details regardless of DebugLog setting
     g_debugLog = true;
-    Log("=== JustSkip v2.3 starting ===");
+    Log("=== JustSkip v2.5 starting ===");
     Log("INI path: %s", g_iniPath);
     Log("Log path: %s", g_logPath);
 
@@ -951,11 +1147,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     Log("QPC hook installed");
     g_hookInstalledAt = GetTickCount();
 
+    // Cache frame-generation module ranges for QPC bypass
+    CacheBypassModules();
+
     // Hook game's XInput for combat detection (vibration monitoring)
     if (g_gamepadEnabled) {
         HMODULE hGameXInput = GetModuleHandleA("xinput1_4.dll");
         if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput1_3.dll");
         if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput9_1_0.dll");
+        // Game may not have loaded XInput yet at DLL_PROCESS_ATTACH — try loading it
+        if (!hGameXInput) hGameXInput = LoadLibraryA("xinput1_4.dll");
+        if (!hGameXInput) hGameXInput = LoadLibraryA("xinput1_3.dll");
         if (hGameXInput) {
             // Hook SetState for combat detection (vibration monitoring)
             if (g_combatDetect) {
@@ -972,6 +1174,45 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                 } else {
                     Log("WARNING: XInputSetState not found — combat detection disabled");
                     g_combatDetect = false;
+                }
+            }
+
+            // Hook GetState + GetStateEx to suppress modifier + speed buttons
+            if (g_suppressButtons && g_suppressMask != 0 && g_gamepadModifier != 0) {
+                bool anyHooked = false;
+
+                // Standard XInputGetState (export by name, fallback ordinal 3)
+                auto pfnGetState = (PFN_XInputGetState)GetProcAddress(hGameXInput, "XInputGetState");
+                if (!pfnGetState)
+                    pfnGetState = (PFN_XInputGetState)GetProcAddress(hGameXInput, MAKEINTRESOURCEA(3));
+                if (pfnGetState) {
+                    if (MH_CreateHook(pfnGetState, &HookedXInputGetState,
+                                       reinterpret_cast<LPVOID*>(&g_origXInputGetState)) == MH_OK &&
+                        MH_EnableHook(pfnGetState) == MH_OK) {
+                        Log("XInputGetState hook installed (suppress mask=0x%04X)", g_suppressMask);
+                        anyHooked = true;
+                    } else {
+                        Log("WARNING: XInputGetState hook failed");
+                    }
+                }
+
+                // Undocumented XInputGetStateEx (ordinal 100) — many games use this
+                auto pfnGetStateEx = (PFN_XInputGetState)GetProcAddress(hGameXInput, MAKEINTRESOURCEA(100));
+                if (pfnGetStateEx && pfnGetStateEx != pfnGetState) {
+                    if (MH_CreateHook(pfnGetStateEx, &HookedXInputGetStateEx,
+                                       reinterpret_cast<LPVOID*>(&g_origXInputGetStateEx)) == MH_OK &&
+                        MH_EnableHook(pfnGetStateEx) == MH_OK) {
+                        Log("XInputGetStateEx hook installed (ordinal 100)");
+                        anyHooked = true;
+                    } else {
+                        Log("WARNING: XInputGetStateEx hook failed");
+                    }
+                }
+
+                if (!anyHooked) {
+                    Log("WARNING: No GetState hooks installed — button suppression disabled");
+                    g_suppressButtons = false;
+                    g_suppressHookFailed = true;
                 }
             }
         } else {
