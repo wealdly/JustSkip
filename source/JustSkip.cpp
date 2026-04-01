@@ -1068,7 +1068,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             if (targetSpeed == 1.0f)
                 ShowOSD("Speed: 1x (Normal)");
             else
-                ShowOSD("Speed: %.1fx", targetSpeed);
+                ShowOSD("Speed: %.2fx", targetSpeed);
         }
     }
 
@@ -1097,7 +1097,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Always log startup details regardless of DebugLog setting
     g_debugLog = true;
-    Log("=== JustSkip v2.5 starting ===");
+    Log("=== JustSkip v2.51 starting ===");
     Log("INI path: %s", g_iniPath);
     Log("Log path: %s", g_logPath);
 

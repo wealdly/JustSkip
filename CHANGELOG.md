@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.51 — 2026-04-01
+
+### Fixed
+- **OSD speed display precision** — speed now shows two decimal places (e.g. 0.35x instead of 0.3x)
+
 ## v2.5 — 2026-03-31
 
 ### Added
