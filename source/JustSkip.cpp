@@ -1,4 +1,4 @@
-// JustSkip — Game speed control for Crimson Desert
+﻿// JustSkip — Game speed control for Crimson Desert
 // Copyright (c) 2026 wealdly. All rights reserved.
 // Hooks QueryPerformanceCounter to scale time. No Cheat Engine needed.
 
@@ -21,17 +21,32 @@
 // ---------------------------------------------------------------------------
 typedef DWORD(WINAPI* PFN_XInputGetState)(DWORD dwUserIndex, XINPUT_STATE* pState);
 typedef DWORD(WINAPI* PFN_XInputSetState)(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration);
-static PFN_XInputGetState g_pXInputGetState     = nullptr; // raw fn ptr for our polling
-static PFN_XInputSetState g_origXInputSetState   = nullptr; // trampoline for game's SetState
-static bool               g_xinputLoaded         = false;
-static int                g_detectedPadIndex     = -1;     // auto-detected at runtime
-static PFN_XInputGetState g_origXInputGetState   = nullptr; // MinHook trampoline for game's GetState
-static PFN_XInputGetState g_origXInputGetStateEx  = nullptr; // MinHook trampoline for game's GetStateEx (ordinal 100)
+static PFN_XInputSetState g_origXInputSetState  = nullptr; // trampoline for game's SetState
+static PFN_XInputGetState g_origXInputGetState  = nullptr; // MinHook trampoline for game's GetState
+static PFN_XInputGetState g_origXInputGetStateEx = nullptr; // MinHook trampoline for game's GetStateEx (ordinal 100)
+static bool               g_xinputLoaded         = false;  // set after hooks installed
 static WORD               g_suppressMask         = 0;       // modifier | all slot gamepad buttons (precomputed)
 static bool               g_suppressButtons      = true;    // INI: SuppressButtons=1
 static bool               g_suppressHookFailed   = false;   // set on hook failure; prevents hot-reload re-enabling
-static thread_local bool  g_inJSPoll             = false;   // bypass: JustSkip's own polls skip the hook
 static std::atomic<WORD>  g_suppressLastLog{0};             // last stripped mask logged (dedup, written from hook thread)
+
+// Shadow state — raw button data saved by hook BEFORE stripping, read by hotkey thread.
+// Avoids independent XInput calls from the hotkey thread, which fail when Steam routes
+// button state only through the module the game originally loaded (not system32).
+//
+// Debounce: the game polls XInput many times per frame from multiple code paths.
+// A single poll returning wButtons=0 must NOT immediately clear the shadow — it may
+// just be a sub-frame gap. Only clear buttons after they've been consistently absent
+// for SHADOW_DEBOUNCE_MS, matching the release debounce in SuppressButtons.
+static const DWORD SHADOW_DEBOUNCE_MS = 32; // ~2 frames @ 60fps
+
+struct PadShadow {
+    volatile WORD  buttons     = 0;
+    volatile BYTE  ltrigger    = 0;
+    volatile bool  valid       = false;
+    volatile DWORD btnZeroTick = 0;   // GetTickCount when buttons first became 0
+};
+static PadShadow g_padShadow[XUSER_MAX_COUNT];
 
 
 
@@ -323,23 +338,7 @@ static void ResolveCombatSignature() {
     }
 }
 
-// ---------------------------------------------------------------------------
-//  XInput — dynamic loading (bypass Steam overlay by loading from System32)
-// ---------------------------------------------------------------------------
 typedef DWORD(WINAPI* PFN_XInputGetStateEx)(DWORD dwUserIndex, XINPUT_STATE* pState);
-static PFN_XInputGetStateEx g_pXInputGetStateEx = nullptr;
-
-// Unified helper — prefer undocumented GetStateEx, fall back to GetState.
-// Sets g_inJSPoll so HookedXInputGetState skips filtering on our own polls.
-static DWORD CallXInputGetState(DWORD idx, XINPUT_STATE* pState) {
-    g_inJSPoll = true;
-    DWORD r;
-    if (g_pXInputGetStateEx) r = g_pXInputGetStateEx(idx, pState);
-    else if (g_pXInputGetState) r = g_pXInputGetState(idx, pState);
-    else r = ERROR_DEVICE_NOT_CONNECTED;
-    g_inJSPoll = false;
-    return r;
-}
 
 // XInputSetState hook — detect vibration (combat indicator)
 static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration) {
@@ -366,141 +365,131 @@ static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pV
 //   - If held < 250ms and no speed button was pressed → inject Back for ~150ms
 //     so the game registers the quick tap (zoom toggle).
 //   - If held >= 250ms OR a speed button was pressed → game never sees Back.
-static void SuppressButtons(XINPUT_STATE* pState) {
-    static DWORD s_modDownTick  = 0;   // tick when modifier was first pressed
-    static DWORD s_replayUntil  = 0;   // tick until which we inject Back after release
-    static bool  s_comboSeen    = false; // true once a speed button appeared this hold
+//
+// Release debounce: the game polls XInput several times per frame from different
+// codepaths. A single poll returning Back=0 should not count as "released" — only
+// consistent absence for >= RELEASE_DEBOUNCE_MS counts. Without this, a brief
+// gap between polls fires the quick-tap replay immediately, which then holds the
+// modifier in the injected/replaying state so the hotkey thread never sees it as
+// physically held and combos never fire.
+static __forceinline void SuppressButtons(XINPUT_STATE* pState) {
+    static DWORD s_modDownTick    = 0;
+    static DWORD s_modUpTick      = 0;
+    static DWORD s_replayUntil    = 0;
+    static bool  s_comboSeen      = false;
+
+    static const DWORD RELEASE_DEBOUNCE_MS = SHADOW_DEBOUNCE_MS;
 
     const WORD speedMask = g_suppressMask & ~g_gamepadModifier;
-    const bool modHeld   = (pState->Gamepad.wButtons & g_gamepadModifier) == g_gamepadModifier;
-    const bool speedHeld = (pState->Gamepad.wButtons & speedMask) != 0;
-    DWORD now = GetTickCount();
 
-    // Replay phase: modifier was released quickly, inject Back for a few frames
+    // Derive held state from the OR of all shadow slots — NOT from pState->Gamepad.wButtons.
+    // The game polls all 4 XInput indices; the virtual slot (often index 0) returns wButtons=0
+    // even while the physical controller (index 1+) holds Back. Reading only the current slot
+    // causes false releases that trigger the debounce countdown and let Back bleed through.
+    bool modHeld      = false;
+    bool speedHeld    = false;
+    for (int _si = 0; _si < XUSER_MAX_COUNT; _si++) {
+        const PadShadow& _sh = g_padShadow[_si];
+        if (_sh.valid) {
+            if ((_sh.buttons & g_gamepadModifier) == g_gamepadModifier) modHeld   = true;
+            if (_sh.buttons & speedMask)                                 speedHeld = true;
+        }
+    }
+
+    // Replay phase: check without GetTickCount first — s_replayUntil == 0 is the common path
     if (s_replayUntil != 0) {
+        DWORD now = GetTickCount();
         if (now <= s_replayUntil && !modHeld) {
-            pState->Gamepad.wButtons |= g_gamepadModifier;  // inject the tap
+            pState->Gamepad.wButtons |= g_gamepadModifier;
             return;
         }
-        s_replayUntil = 0;  // replay window expired or button re-pressed
+        s_replayUntil = 0;
     }
 
     if (!modHeld) {
-        // Modifier just released — decide whether to replay
-        if (s_modDownTick != 0 && !s_comboSeen && (now - s_modDownTick) < 250) {
-            // Quick tap, no combo — replay Back for 150ms so game sees the press
-            s_replayUntil = now + 150;
-            pState->Gamepad.wButtons |= g_gamepadModifier;  // first replay frame
-            Log("GetState hook: quick-tap replay (held %lums)", now - s_modDownTick);
+        if (s_modDownTick != 0) {
+            DWORD now = GetTickCount();
+            if (s_modUpTick == 0) s_modUpTick = now;
+            if ((now - s_modUpTick) >= RELEASE_DEBOUNCE_MS) {
+                if (!s_comboSeen && (now - s_modDownTick) < 250) {
+                    s_replayUntil = now + 150;
+                    pState->Gamepad.wButtons |= g_gamepadModifier;
+                    Log("GetState hook: quick-tap replay (held %lums)",
+                        s_modUpTick - s_modDownTick);
+                }
+                s_modDownTick = 0;
+                s_modUpTick   = 0;
+                s_comboSeen   = false;
+                if (g_debugLog) g_suppressLastLog.store(0, std::memory_order_relaxed);
+            }
         }
-        s_modDownTick = 0;
-        s_comboSeen   = false;
-        g_suppressLastLog.store(0, std::memory_order_relaxed);
         return;
     }
 
-    // Modifier is held — always suppress it and any speed buttons
+    // Modifier is physically held
+    s_modUpTick = 0;
     if (s_modDownTick == 0)
-        s_modDownTick = now;
+        s_modDownTick = GetTickCount();
 
     if (speedHeld)
         s_comboSeen = true;
 
     WORD before = pState->Gamepad.wButtons;
     pState->Gamepad.wButtons &= ~g_suppressMask;
-    WORD stripped = before & g_suppressMask;
-    WORD prev = g_suppressLastLog.exchange(stripped, std::memory_order_relaxed);
-    if (stripped != prev)
-        Log("GetState hook: stripped 0x%04X from game wButtons", stripped);
+    if (g_debugLog) {
+        WORD stripped = before & g_suppressMask;
+        if (stripped != 0) {
+            WORD prev = g_suppressLastLog.exchange(stripped, std::memory_order_relaxed);
+            if (stripped != prev)
+                Log("GetState hook: stripped 0x%04X from game wButtons", stripped);
+        } else {
+            g_suppressLastLog.store(0, std::memory_order_relaxed);
+        }
+    }
+}
+
+// Shared GetState hook body — called by both standard and Ex variants.
+// Populates the shadow state buffer (raw buttons BEFORE stripping) so the
+// hotkey thread can read real physical state without making its own XInput calls.
+static __forceinline DWORD XInputGetStateImpl(DWORD dwUserIndex, XINPUT_STATE* pState,
+                                              PFN_XInputGetState orig) {
+    DWORD result = orig(dwUserIndex, pState);
+    if (dwUserIndex < XUSER_MAX_COUNT && pState) {
+        PadShadow& sh = g_padShadow[dwUserIndex];
+        if (result == ERROR_SUCCESS) {
+            WORD rawBtns = pState->Gamepad.wButtons;
+            if (rawBtns != 0) {
+                sh.buttons     = rawBtns;
+                sh.btnZeroTick = 0;
+            } else if (sh.buttons != 0) {
+                // Only pay for GetTickCount when there's a non-zero value to potentially clear
+                DWORD tick = GetTickCount();
+                if (sh.btnZeroTick == 0) sh.btnZeroTick = tick;
+                if ((tick - sh.btnZeroTick) >= SHADOW_DEBOUNCE_MS)
+                    sh.buttons = 0;
+            }
+            sh.ltrigger = pState->Gamepad.bLeftTrigger;
+            sh.valid    = true;
+        } else if (result == ERROR_DEVICE_NOT_CONNECTED) {
+            sh.valid       = false;
+            sh.buttons     = 0;
+            sh.btnZeroTick = 0;
+        }
+    }
+    if (result == ERROR_SUCCESS && pState &&
+        g_suppressButtons && g_suppressMask != 0 && g_gamepadModifier != 0)
+        SuppressButtons(pState);
+    return result;
 }
 
 // XInputGetState hook (standard export + ordinal 3)
 static DWORD WINAPI HookedXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState) {
-    DWORD result = g_origXInputGetState(dwUserIndex, pState);
-    if (g_inJSPoll) return result;
-    if (result == ERROR_SUCCESS && pState &&
-        (int)dwUserIndex == g_detectedPadIndex &&
-        g_suppressButtons && g_suppressMask != 0 && g_gamepadModifier != 0)
-        SuppressButtons(pState);
-    return result;
+    return XInputGetStateImpl(dwUserIndex, pState, g_origXInputGetState);
 }
 
 // XInputGetStateEx hook (undocumented ordinal 100 — used by many games)
 static DWORD WINAPI HookedXInputGetStateEx(DWORD dwUserIndex, XINPUT_STATE* pState) {
-    DWORD result = g_origXInputGetStateEx(dwUserIndex, pState);
-    if (g_inJSPoll) return result;
-    if (result == ERROR_SUCCESS && pState &&
-        (int)dwUserIndex == g_detectedPadIndex &&
-        g_suppressButtons && g_suppressMask != 0 && g_gamepadModifier != 0)
-        SuppressButtons(pState);
-    return result;
-}
-
-static void LoadXInput() {
-    // Strategy: load directly from System32 to bypass Steam's XInput wrapper.
-    // Steam hooks GetModuleHandle/LoadLibrary for xinput DLLs and returns its own
-    // proxy that can return stale/zero data even when "Steam Input" is disabled.
-
-    char sysDir[MAX_PATH];
-    GetSystemDirectoryA(sysDir, MAX_PATH);
-
-    static const char* dllNames[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
-
-    for (auto name : dllNames) {
-        char fullPath[MAX_PATH];
-        sprintf_s(fullPath, "%s\\%s", sysDir, name);
-
-        // Use LOAD_WITH_ALTERED_SEARCH_PATH to guarantee we get the real DLL
-        HMODULE hMod = LoadLibraryExA(fullPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        if (!hMod) {
-            // Fallback: try loading by name alone (works on most systems)
-            hMod = LoadLibraryExA(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        }
-        if (!hMod) {
-            // Last resort: plain LoadLibrary
-            hMod = LoadLibraryA(fullPath);
-        }
-        if (!hMod) {
-            Log("  XInput: %s not found (err=%lu)", name, GetLastError());
-            continue;
-        }
-
-        // Try XInputGetStateEx (ordinal 100) — undocumented, reports Guide button,
-        // and sometimes bypasses filtering that affects the standard export
-        auto pfnEx = (PFN_XInputGetStateEx)GetProcAddress(hMod, MAKEINTRESOURCEA(100));
-        auto pfn = (PFN_XInputGetState)GetProcAddress(hMod, "XInputGetState");
-        if (!pfn) pfn = (PFN_XInputGetState)GetProcAddress(hMod, MAKEINTRESOURCEA(3));
-
-        if (pfn || pfnEx) {
-            g_pXInputGetState   = pfn;
-            g_pXInputGetStateEx = pfnEx;
-            g_xinputLoaded = true;
-            Log("XInput loaded from %s (%s)", fullPath, pfnEx ? "GetStateEx" : "GetState");
-            return;
-        }
-        FreeLibrary(hMod);
-    }
-    Log("WARNING: Could not load any XInput DLL from System32");
-
-    // Fallback: use whatever XInput the game already loaded (may be Steam's wrapper,
-    // but better than no gamepad support at all)
-    for (auto name : dllNames) {
-        HMODULE hMod = GetModuleHandleA(name);
-        if (!hMod) continue;
-
-        auto pfnEx = (PFN_XInputGetStateEx)GetProcAddress(hMod, MAKEINTRESOURCEA(100));
-        auto pfn = (PFN_XInputGetState)GetProcAddress(hMod, "XInputGetState");
-        if (!pfn) pfn = (PFN_XInputGetState)GetProcAddress(hMod, MAKEINTRESOURCEA(3));
-
-        if (pfn || pfnEx) {
-            g_pXInputGetState   = pfn;
-            g_pXInputGetStateEx = pfnEx;
-            g_xinputLoaded = true;
-            Log("XInput fallback: using game's %s (%s)", name, pfnEx ? "GetStateEx" : "GetState");
-            return;
-        }
-    }
-    Log("WARNING: No XInput DLL available — gamepad support disabled");
+    return XInputGetStateImpl(dwUserIndex, pState, g_origXInputGetStateEx);
 }
 
 // ---------------------------------------------------------------------------
@@ -560,14 +549,17 @@ static __forceinline bool IsCallerBypassed() {
 typedef BOOL(WINAPI* PFN_QPC)(LARGE_INTEGER* lpCounter);
 static PFN_QPC g_origQPC = nullptr;
 
-static SRWLOCK       g_timeLock   = SRWLOCK_INIT;
-static LARGE_INTEGER g_realBase   = {};
-static LARGE_INTEGER g_fakeBase   = {};
-static double        g_curSpeed   = 1.0;
-static bool          g_timeInited = false;
-static LONGLONG      g_qpcFreq    = 0;     // cached QPC frequency
+static SRWLOCK            g_timeLock    = SRWLOCK_INIT;
+static LARGE_INTEGER      g_realBase    = {};
+static LARGE_INTEGER      g_fakeBase    = {};
+static double             g_curSpeed    = 1.0;
+static bool               g_timeInited  = false;
+static std::atomic<bool>  g_everScaled{false};     // set on first non-1.0 speed; enables scaling path
 
 static void SetSpeed(double speed) {
+    if (speed != 1.0)
+        g_everScaled.store(true, std::memory_order_relaxed);
+
     AcquireSRWLockExclusive(&g_timeLock);
 
     LARGE_INTEGER realNow;
@@ -591,14 +583,21 @@ static void SetSpeed(double speed) {
 static BOOL WINAPI HookedQPC(LARGE_INTEGER* lpCounter) {
     if (!lpCounter) return FALSE;
 
+    // Check bypass BEFORE calling real QPC — bypassed callers (OptiScaler, DLSS-G, etc.)
+    // call QPC very frequently; the old order caused every bypassed call to invoke real QPC
+    // twice (once here, once via g_origQPC below), doubling their overhead.
+    if (g_bypassCount > 0 && IsCallerBypassed()) {
+        return g_origQPC(lpCounter);
+    }
+
+    // Fast pass-through when no speed change has ever been applied.
+    // Eliminates all lock/math overhead while the mod is idle at 1x speed.
+    if (!g_everScaled.load(std::memory_order_relaxed)) {
+        return g_origQPC(lpCounter);
+    }
+
     LARGE_INTEGER realNow;
     g_origQPC(&realNow);
-
-    // Let frame-generation DLLs see real unscaled time
-    if (g_bypassCount > 0 && IsCallerBypassed()) {
-        *lpCounter = realNow;
-        return TRUE;
-    }
 
     AcquireSRWLockShared(&g_timeLock);
 
@@ -632,7 +631,6 @@ static BOOL WINAPI HookedQPC(LARGE_INTEGER* lpCounter) {
 //  On-screen display (OSD) — lightweight overlay for speed notifications
 // ---------------------------------------------------------------------------
 #define WM_OSD_SHOW  (WM_USER + 100)
-#define WM_OSD_HIDE  (WM_USER + 101)
 #define OSD_TIMER_ID 1
 
 static char g_osdText[128] = {};
@@ -785,10 +783,8 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     Log("Hotkey thread started");
 
     if (g_gamepadEnabled && g_gamepadModifier != 0) {
-        LoadXInput();
-        g_detectedPadIndex = g_gamepadIndex > 0 ? g_gamepadIndex : -1;
         if (g_xinputLoaded)
-            Log("Gamepad support active — scanning for controllers");
+            Log("Gamepad support active");
     } else {
         Log("Gamepad disabled — keyboard only");
     }
@@ -804,54 +800,24 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             continue;
         }
 
-        // --- Poll gamepad state (XInput from System32, bypasses Steam) ---
-        static DWORD lastPadAttempt = 0;
-        static bool  padWasConnected = false;
+        // --- Gamepad state — OR all shadow slots together ---
+        // The hook populates g_padShadow[slot] for every XInput call the game makes.
+        // We combine all valid slots so we work regardless of which index Steam assigns
+        // the physical controller to. No index detection or scanning needed here.
         WORD padButtons = 0;
         BYTE padLeftTrigger = 0;
         bool padConnected = false;
 
+        DWORD now = GetTickCount();
+
         if (g_gamepadEnabled && g_xinputLoaded && g_gamepadModifier != 0) {
-            DWORD now = GetTickCount();
-            bool shouldPoll = padWasConnected || (now - lastPadAttempt >= 2000);
-            if (shouldPoll) {
-                if (g_detectedPadIndex < 0) {
-                    DWORD bestPkt = 0;
-                    int   bestIdx = -1;
-                    for (int idx = 0; idx < 4; idx++) {
-                        XINPUT_STATE testState = {};
-                        DWORD r = CallXInputGetState(idx, &testState);
-                        if (r == ERROR_SUCCESS && testState.dwPacketNumber > bestPkt) {
-                            bestPkt = testState.dwPacketNumber;
-                            bestIdx = idx;
-                        }
-                    }
-                    if (bestIdx >= 0) {
-                        g_detectedPadIndex = bestIdx;
-                        Log("Auto-detected controller on index %d (pkt=%lu)", bestIdx, bestPkt);
-                    }
-                    lastPadAttempt = now;
-                }
-                if (g_detectedPadIndex >= 0) {
-                    XINPUT_STATE padState = {};
-                    DWORD result = CallXInputGetState(g_detectedPadIndex, &padState);
-                    padConnected = (result == ERROR_SUCCESS);
-                    if (padConnected) {
-                        padButtons = padState.Gamepad.wButtons;
-                        padLeftTrigger = padState.Gamepad.bLeftTrigger;
-                        if (!padWasConnected) {
-                            Log("Gamepad %d connected (pkt=%lu)",
-                                g_detectedPadIndex, padState.dwPacketNumber);
-                            padWasConnected = true;
-                        }
-                    } else {
-                        if (padWasConnected) {
-                            Log("Gamepad %d disconnected", g_detectedPadIndex);
-                            g_detectedPadIndex = -1;
-                            padWasConnected = false;
-                        }
-                        lastPadAttempt = now;
-                    }
+            for (int idx = 0; idx < XUSER_MAX_COUNT; idx++) {
+                const PadShadow& sh = g_padShadow[idx];
+                if (sh.valid) {
+                    padConnected    = true;
+                    padButtons     |= sh.buttons;
+                    if (sh.ltrigger > padLeftTrigger)
+                        padLeftTrigger = sh.ltrigger;
                 }
             }
         }
@@ -873,7 +839,6 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
                 for (int i = 0; i < g_slotCount; i++)
                     g_slots[i].active = false;
                 LoadConfig();
-                g_detectedPadIndex = g_gamepadIndex > 0 ? g_gamepadIndex : -1;
                 SetSpeed(1.0);
                 Log("Config reloaded");
                 ShowOSD("JustSkip: Config Reloaded");
@@ -881,8 +846,6 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         } else {
             reloadDown = false;
         }
-
-        DWORD now = GetTickCount();
 
         float targetSpeed = 1.0f;
         bool anyHoldActive = false;
@@ -1097,7 +1060,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Always log startup details regardless of DebugLog setting
     g_debugLog = true;
-    Log("=== JustSkip v2.51 starting ===");
+    Log("=== JustSkip v2.7 starting ===");
     Log("INI path: %s", g_iniPath);
     Log("Log path: %s", g_logPath);
 
@@ -1113,12 +1076,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         ResolveCombatSignature();
     }
 
-    // Cache QPC frequency
-    LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
-    g_qpcFreq = freq.QuadPart;
-    Log("QPC freq: %lld Hz", g_qpcFreq);
-
     if (!g_enabled) {
         Log("Mod disabled via INI — exiting");
         return TRUE;
@@ -1129,17 +1086,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         return TRUE;
     }
 
+    // Helper: create + enable one hook; returns false and logs on any failure.
+    auto InstallHook = [](LPVOID target, LPVOID detour, LPVOID* orig, const char* name) -> bool {
+        if (MH_CreateHook(target, detour, orig) != MH_OK) {
+            Log("ERROR: MH_CreateHook(%s) failed", name);
+            return false;
+        }
+        if (MH_EnableHook(target) != MH_OK) {
+            Log("ERROR: MH_EnableHook(%s) failed", name);
+            return false;
+        }
+        return true;
+    };
+
     auto pfnQPC = reinterpret_cast<LPVOID>(&QueryPerformanceCounter);
-
-    if (MH_CreateHook(pfnQPC, &HookedQPC,
-                       reinterpret_cast<LPVOID*>(&g_origQPC)) != MH_OK) {
-        Log("ERROR: MH_CreateHook(QPC) failed");
-        MH_Uninitialize();
-        return TRUE;
-    }
-
-    if (MH_EnableHook(pfnQPC) != MH_OK) {
-        Log("ERROR: MH_EnableHook(QPC) failed");
+    if (!InstallHook(pfnQPC, &HookedQPC, reinterpret_cast<LPVOID*>(&g_origQPC), "QPC")) {
         MH_Uninitialize();
         return TRUE;
     }
@@ -1162,17 +1123,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             // Hook SetState for combat detection (vibration monitoring)
             if (g_combatDetect) {
                 auto pfnSetState = (PFN_XInputSetState)GetProcAddress(hGameXInput, "XInputSetState");
-                if (pfnSetState) {
-                    if (MH_CreateHook(pfnSetState, &HookedXInputSetState,
-                                       reinterpret_cast<LPVOID*>(&g_origXInputSetState)) == MH_OK &&
-                        MH_EnableHook(pfnSetState) == MH_OK) {
-                        Log("XInputSetState hook installed (combat detection active)");
-                    } else {
-                        Log("WARNING: XInputSetState hook failed — combat detection disabled");
-                        g_combatDetect = false;
-                    }
+                if (pfnSetState && InstallHook(pfnSetState, &HookedXInputSetState,
+                                               reinterpret_cast<LPVOID*>(&g_origXInputSetState),
+                                               "XInputSetState")) {
+                    Log("XInputSetState hook installed (combat detection active)");
                 } else {
-                    Log("WARNING: XInputSetState not found — combat detection disabled");
+                    Log("WARNING: XInputSetState hook failed/not found — combat detection disabled");
                     g_combatDetect = false;
                 }
             }
@@ -1185,34 +1141,29 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                 auto pfnGetState = (PFN_XInputGetState)GetProcAddress(hGameXInput, "XInputGetState");
                 if (!pfnGetState)
                     pfnGetState = (PFN_XInputGetState)GetProcAddress(hGameXInput, MAKEINTRESOURCEA(3));
-                if (pfnGetState) {
-                    if (MH_CreateHook(pfnGetState, &HookedXInputGetState,
-                                       reinterpret_cast<LPVOID*>(&g_origXInputGetState)) == MH_OK &&
-                        MH_EnableHook(pfnGetState) == MH_OK) {
-                        Log("XInputGetState hook installed (suppress mask=0x%04X)", g_suppressMask);
-                        anyHooked = true;
-                    } else {
-                        Log("WARNING: XInputGetState hook failed");
-                    }
+                if (pfnGetState && InstallHook(pfnGetState, &HookedXInputGetState,
+                                               reinterpret_cast<LPVOID*>(&g_origXInputGetState),
+                                               "XInputGetState")) {
+                    Log("XInputGetState hook installed (suppress mask=0x%04X)", g_suppressMask);
+                    anyHooked = true;
                 }
 
                 // Undocumented XInputGetStateEx (ordinal 100) — many games use this
                 auto pfnGetStateEx = (PFN_XInputGetState)GetProcAddress(hGameXInput, MAKEINTRESOURCEA(100));
-                if (pfnGetStateEx && pfnGetStateEx != pfnGetState) {
-                    if (MH_CreateHook(pfnGetStateEx, &HookedXInputGetStateEx,
-                                       reinterpret_cast<LPVOID*>(&g_origXInputGetStateEx)) == MH_OK &&
-                        MH_EnableHook(pfnGetStateEx) == MH_OK) {
-                        Log("XInputGetStateEx hook installed (ordinal 100)");
-                        anyHooked = true;
-                    } else {
-                        Log("WARNING: XInputGetStateEx hook failed");
-                    }
+                if (pfnGetStateEx && pfnGetStateEx != pfnGetState &&
+                    InstallHook(pfnGetStateEx, &HookedXInputGetStateEx,
+                                reinterpret_cast<LPVOID*>(&g_origXInputGetStateEx),
+                                "XInputGetStateEx")) {
+                    Log("XInputGetStateEx hook installed (ordinal 100)");
+                    anyHooked = true;
                 }
 
                 if (!anyHooked) {
                     Log("WARNING: No GetState hooks installed — button suppression disabled");
                     g_suppressButtons = false;
                     g_suppressHookFailed = true;
+                } else {
+                    g_xinputLoaded = true;  // shadow buffer will be populated by the hooks
                 }
             }
         } else {

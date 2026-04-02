@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.7 — 2026-04-01
+
+### Fixed
+- **Button suppression now stable with Steam's virtual controller slot** — `modHeld`/`speedHeld` in the suppression logic now read from the OR of all shadow slots instead of the per-call `pState`; previously, polls against Steam's virtual slot (always `wButtons=0`) would start the release debounce countdown while Back was still physically held, causing Back to bleed through as a zoom or menu open
+- **Suppression log noise** — debug log no longer emits `stripped 0x0000` entries when a zero-button poll passes through the suppression path
+
+## v2.6 — 2026-04-01
+
+### Fixed
+- **Gamepad combos now work with Steam** — replaced independent XInput polling with a shadow state buffer; the hook captures raw button state from the game's own XInput calls before stripping, so the hotkey thread reads real physical buttons regardless of which module Steam routes data through
+- **Controller index detection** — hotkey thread now ORs all 4 XInput shadow slots, eliminating false detection of Steam's virtual remapping slot at index 0 when the physical controller is at index 1 or higher
+- **Sub-frame button flicker** — shadow buffer debounced at 32ms; consecutive zero-button polls from the game's multi-path XInput calls no longer clear the last-seen button state between hotkey thread reads
+
+### Changed
+- Removed `LoadXInput()` and independent XInput polling entirely — button state is now sourced exclusively from the game's own XInput calls via the hook
+- `g_xinputLoaded` now reflects whether GetState hooks are installed rather than whether a separate DLL was loaded
+
+### Performance
+- `SuppressButtons` and `XInputGetStateImpl` defer `GetTickCount()` calls to only when timers are active (idle path costs zero syscalls)
+- Strip logging atomic (`g_suppressLastLog`) guarded by `g_debugLog` — zero overhead with debug off
+
 ## v2.51 — 2026-04-01
 
 ### Fixed
@@ -11,7 +32,6 @@
 - **QPC caller bypass for frame generation** — `_ReturnAddress()` check skips time scaling for OptiScaler, FSR Frame Generation, and Streamline/DLSS-G DLLs, preventing frame generation from disabling when speed changes
 
 ### Fixed
-- **Button suppression per-controller filtering** — suppression now only applies to the detected controller index, fixing false "release" events from unused indices that caused Back to bleed through
 - **Quick-tap reliability** — increased tap threshold from 150ms to 250ms and replay window from 60ms to 150ms for more consistent Back/View passthrough on quick presses
 
 ## v2.4 — 2026-03-31
@@ -19,7 +39,6 @@
 ### Added
 - **Button suppression** — hooks the game's `XInputGetState` via MinHook; when the modifier (Back/View) is held, the modifier bit and all configured speed-button bits are stripped from `wButtons` before the game sees them, preventing accidental menu opens and in-game interactions during speed combos
 - `SuppressButtons=1` INI setting (default enabled) — set to 0 to disable if needed
-- `g_inJSPoll` thread-local bypass flag ensures JustSkip's own controller polling is never filtered even if the game and JustSkip resolve to the same XInput DLL (non-Steam installs)
 
 ## v2.3 — 2026-03-31
 
