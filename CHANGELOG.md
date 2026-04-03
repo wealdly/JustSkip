@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.71 — 2026-04-02
+
+### Fixed
+- **Gamepad combos broken when `SuppressButtons=0`** — XInput hooks (which populate the shadow buffer for combo detection) were only installed when button suppression was enabled; users with suppression disabled got no shadow data and combos silently stopped working, a regression from v2.6
+
 ## v2.7 — 2026-04-01
 
 ### Fixed

@@ -1060,7 +1060,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Always log startup details regardless of DebugLog setting
     g_debugLog = true;
-    Log("=== JustSkip v2.7 starting ===");
+    Log("=== JustSkip v2.71 starting ===");
     Log("INI path: %s", g_iniPath);
     Log("Log path: %s", g_logPath);
 
@@ -1133,8 +1133,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                 }
             }
 
-            // Hook GetState + GetStateEx to suppress modifier + speed buttons
-            if (g_suppressButtons && g_suppressMask != 0 && g_gamepadModifier != 0) {
+            // Hook GetState + GetStateEx.
+            // Always install when gamepad modifier is configured — shadow buffer needs
+            // these hooks to populate regardless of whether suppression is enabled.
+            // The suppression strip logic inside XInputGetStateImpl is already guarded
+            // by g_suppressButtons, so installing with suppression off is safe.
+            if (g_gamepadModifier != 0) {
                 bool anyHooked = false;
 
                 // Standard XInputGetState (export by name, fallback ordinal 3)
@@ -1159,7 +1163,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                 }
 
                 if (!anyHooked) {
-                    Log("WARNING: No GetState hooks installed — button suppression disabled");
+                    Log("WARNING: No GetState hooks installed — gamepad combos and button suppression disabled");
                     g_suppressButtons = false;
                     g_suppressHookFailed = true;
                 } else {
