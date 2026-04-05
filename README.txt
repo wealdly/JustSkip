@@ -11,19 +11,23 @@ FEATURES
   - Toggle speeds: press to lock a speed, press again for 1x (mutually exclusive)
   - Hold speed: fast only while held, overrides any active toggle
   - Hot-reload: edit the INI mid-game, press F6 to apply
-  - Gamepad: XInput with modifier + D-pad combos (bypasses Steam Input)
+  - Gamepad: XInput with modifier + face button combos (bypasses Steam Input)
+  - Button suppression: modifier and speed buttons are hidden from the game, preventing
+    accidental zoom or menu activation during combos
   - Combat detection: optional multi-signal fusion resets speed during fights
   - Patch-proof: hooks QueryPerformanceCounter, not game code — survives updates
+  - Frame generation compatible: QPC bypass for OptiScaler, FSR-FG, and DLSS-G keeps
+    frame gen running during speed changes
 
 DEFAULT HOTKEYS
 ---------------
 
   Keyboard        Gamepad             Mode        Speed
   --------        -------             ----        -----
-  F7              LB + X              Toggle      1.2x
+  F7              Back + X            Toggle      1.2x
   F8              —                   Toggle      2x
-  F9              —                   Toggle      4x
-  F10             LB + A              Hold        8x
+  F9              Back + A            Toggle      4x
+  F10             —                   Hold        8x
   F6              —                   —           Reload config
 
   XInput is read directly from System32, bypassing Steam Input entirely.
@@ -79,8 +83,9 @@ CONFIGURATION
 
     [Settings]
     GamepadEnabled=1           ; 0 = keyboard only (skips XInput entirely)
-    GamepadModifier=0100       ; LB (hold first)
+    GamepadModifier=0020       ; Back/View (hold first). 0000 = no modifier (direct presses)
     GamepadIndex=0             ; Controller 0-3
+    SuppressButtons=1          ; Hide modifier+speed buttons from game (prevents zoom toggle)
 
   Set GamepadEnabled=0 to disable all gamepad functionality (no XInput loading or polling).
   Set a slot's GamepadButton=0000 to disable its gamepad binding.
@@ -113,9 +118,19 @@ COMBAT DETECTION (optional)
 TROUBLESHOOTING
 ---------------
 
-  Set DebugLog=1 in the INI to generate JustSkip.log. Check that:
+  Set DebugLog=1 in the INI to generate JustSkip.log.
+
+  Basic checks:
     - An ASI loader is present in bin64/ (e.g. winmm.dll)
     - The log shows "QPC hook installed"
+
+  Gamepad not working:
+    - Log shows "XInput: using xinput1_4.dll" (or 1_3 / 9_1_0) — confirms DLL found
+    - Log shows "Gamepad connected" — confirms controller is seen
+    - Log shows "Modifier pressed" when you hold Back/View — confirms buttons reach the mod
+    - If no modifier is wanted, set GamepadModifier=0000 for direct button presses
+    - If "Gamepad enabled but XInput hooks failed" appears, the game uses an unsupported
+      XInput path; file a bug report with the full log
 
 BUILDING FROM SOURCE
 --------------------

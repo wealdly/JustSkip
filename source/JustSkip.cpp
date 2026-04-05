@@ -294,7 +294,8 @@ static BYTE* ScanSignature(const char* pattern, int offset) {
             BYTE* start = base + sec[i].VirtualAddress;
             DWORD size  = sec[i].Misc.VirtualSize;
 
-            for (DWORD j = 0; j <= size - sigLen; j++) {
+            if ((DWORD)sigLen > size) continue;
+            for (DWORD j = 0; j <= size - (DWORD)sigLen; j++) {
                 bool found = true;
                 for (int k = 0; k < sigLen; k++) {
                     if (msk[k] && start[j + k] != sig[k]) {
@@ -442,8 +443,6 @@ static __forceinline void SuppressButtons(XINPUT_STATE* pState) {
             WORD prev = g_suppressLastLog.exchange(stripped, std::memory_order_relaxed);
             if (stripped != prev)
                 Log("GetState hook: stripped 0x%04X from game wButtons", stripped);
-        } else {
-            g_suppressLastLog.store(0, std::memory_order_relaxed);
         }
     }
 }
@@ -782,9 +781,11 @@ static void ShowOSD(const char* fmt, ...) {
 static DWORD WINAPI HotkeyThread(LPVOID) {
     Log("Hotkey thread started");
 
-    if (g_gamepadEnabled && g_gamepadModifier != 0) {
+    if (g_gamepadEnabled) {
         if (g_xinputLoaded)
-            Log("Gamepad support active");
+            Log("Gamepad support active%s", g_gamepadModifier ? " (modifier required)" : " (no modifier)");
+        else
+            Log("WARNING: Gamepad enabled but XInput hooks failed — keyboard only");
     } else {
         Log("Gamepad disabled — keyboard only");
     }
@@ -810,7 +811,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
 
         DWORD now = GetTickCount();
 
-        if (g_gamepadEnabled && g_xinputLoaded && g_gamepadModifier != 0) {
+        if (g_gamepadEnabled && g_xinputLoaded) {
             for (int idx = 0; idx < XUSER_MAX_COUNT; idx++) {
                 const PadShadow& sh = g_padShadow[idx];
                 if (sh.valid) {
@@ -822,8 +823,26 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             }
         }
 
-        bool modHeld = padConnected && g_gamepadModifier != 0 &&
-                       (padButtons & g_gamepadModifier) == g_gamepadModifier;
+        // modifier==0 means no combo required — any connected pad counts as modifier held
+        bool modHeld = padConnected &&
+                       (g_gamepadModifier == 0 ||
+                        (padButtons & g_gamepadModifier) == g_gamepadModifier);
+
+        // Edge-detect pad connect/disconnect and modifier transitions for debug log
+        {
+            static bool s_prevConnected = false;
+            if (padConnected != s_prevConnected) {
+                s_prevConnected = padConnected;
+                Log("Gamepad %s", padConnected ? "connected" : "disconnected");
+            }
+        }
+        if (g_gamepadModifier != 0) {
+            static bool s_prevModHeld = false;
+            if (modHeld != s_prevModHeld) {
+                s_prevModHeld = modHeld;
+                Log("Modifier %s (buttons=0x%04X)", modHeld ? "pressed" : "released", padButtons);
+            }
+        }
 
         // --- Reload key (edge-detected, keyboard OR gamepad) ---
         static bool reloadDown = false;
@@ -864,6 +883,14 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         // --- Startup grace period: ignore speed changes while game initializes ---
         bool inGrace = g_hookInstalledAt && g_startupGraceMs &&
                        (now - g_hookInstalledAt) < g_startupGraceMs;
+
+        {
+            static bool s_wasInGrace = (g_startupGraceMs > 0);
+            if (s_wasInGrace && !inGrace) {
+                Log("Startup grace expired — speed changes active");
+                s_wasInGrace = false;
+            }
+        }
 
         // --- Hold keys take priority (keyboard + gamepad) ---
         for (int i = 0; i < g_slotCount; i++) {
@@ -1021,7 +1048,17 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         }
 
         // --- Apply speed (skip during startup grace period) ---
-        if (inGrace) targetSpeed = 1.0f;
+        if (inGrace) {
+            if (targetSpeed != 1.0f) {
+                static float s_lastGraceSuppressed = 0.0f;
+                if (targetSpeed != s_lastGraceSuppressed) {
+                    s_lastGraceSuppressed = targetSpeed;
+                    Log("Startup grace: suppressing speed %.2fx (%lums remaining)",
+                        targetSpeed, g_startupGraceMs - (now - g_hookInstalledAt));
+                }
+            }
+            targetSpeed = 1.0f;
+        }
 
         static float lastSpeed = 1.0f;
         if (targetSpeed != lastSpeed) {
@@ -1060,7 +1097,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Always log startup details regardless of DebugLog setting
     g_debugLog = true;
-    Log("=== JustSkip v2.71 starting ===");
+    Log("=== JustSkip v2.72 starting ===");
     Log("INI path: %s", g_iniPath);
     Log("Log path: %s", g_logPath);
 
@@ -1113,13 +1150,31 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     // Hook game's XInput for combat detection (vibration monitoring)
     if (g_gamepadEnabled) {
-        HMODULE hGameXInput = GetModuleHandleA("xinput1_4.dll");
-        if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput1_3.dll");
-        if (!hGameXInput) hGameXInput = GetModuleHandleA("xinput9_1_0.dll");
-        // Game may not have loaded XInput yet at DLL_PROCESS_ATTACH — try loading it
-        if (!hGameXInput) hGameXInput = LoadLibraryA("xinput1_4.dll");
-        if (!hGameXInput) hGameXInput = LoadLibraryA("xinput1_3.dll");
+        // Probe in priority order: newest API first, then legacy variants.
+        // GetModuleHandleA covers static imports (already mapped by the loader).
+        // LoadLibraryA fallback covers delay-loaded games; the OS deduplicates the
+        // HMODULE so our hooks apply to the same module the game will later load.
+        struct { const char* name; bool loaded; } xinputCandidates[] = {
+            { "xinput1_4.dll",   false },
+            { "xinput1_3.dll",   false },
+            { "xinput9_1_0.dll", false },
+        };
+        HMODULE hGameXInput = nullptr;
+        const char* xinputDllName = nullptr;
+        for (auto& c : xinputCandidates) {
+            hGameXInput = GetModuleHandleA(c.name);
+            if (hGameXInput) { xinputDllName = c.name; break; }
+        }
+        if (!hGameXInput) {
+            for (auto& c : xinputCandidates) {
+                hGameXInput = LoadLibraryA(c.name);
+                if (hGameXInput) { xinputDllName = c.name; c.loaded = true; break; }
+            }
+        }
         if (hGameXInput) {
+            Log("XInput: using %s (%s)", xinputDllName,
+                xinputCandidates[0].loaded || xinputCandidates[1].loaded || xinputCandidates[2].loaded
+                ? "loaded by JustSkip fallback" : "already in process");
             // Hook SetState for combat detection (vibration monitoring)
             if (g_combatDetect) {
                 auto pfnSetState = (PFN_XInputSetState)GetProcAddress(hGameXInput, "XInputSetState");
@@ -1133,12 +1188,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                 }
             }
 
-            // Hook GetState + GetStateEx.
-            // Always install when gamepad modifier is configured — shadow buffer needs
-            // these hooks to populate regardless of whether suppression is enabled.
-            // The suppression strip logic inside XInputGetStateImpl is already guarded
-            // by g_suppressButtons, so installing with suppression off is safe.
-            if (g_gamepadModifier != 0) {
+            // Hook GetState + GetStateEx — always install when gamepad is enabled so the
+            // shadow buffer is populated for button reading regardless of modifier config.
+            // (suppression strip inside XInputGetStateImpl is already guarded by g_suppressButtons)
+            {
                 bool anyHooked = false;
 
                 // Standard XInputGetState (export by name, fallback ordinal 3)

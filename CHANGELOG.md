@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.72 — 2026-04-05
+
+### Fixed
+- **Gamepad broken when `GamepadModifier=0000`** — GetState hooks (which populate the shadow buffer) were only installed when the modifier was non-zero; with no modifier configured, `g_xinputLoaded` stayed false, the shadow buffer was never written, and all gamepad input was dead regardless of `GamepadEnabled=1`; hooks now install unconditionally when `GamepadEnabled=1`
+- **`modHeld` blocked by modifier==0 check** — hotkey thread also gated pad-state reading and `modHeld` on `g_gamepadModifier != 0`; `modHeld` now evaluates to `true` whenever the pad is connected and no modifier is configured (direct button presses)
+- **`ScanSignature` DWORD underflow** — `size - sigLen` used unsigned subtraction without a bounds check; if a section was smaller than the AOB pattern, the loop counter wrapped to ~4 billion and scanned garbage memory; an early `continue` now skips undersized sections
+- **`xinput9_1_0.dll` missing from `LoadLibraryA` fallback** — the Vista-era XInput variant was probed by `GetModuleHandleA` but omitted from the load-if-not-found fallback; delay-loading games on that variant silently produced "No XInput DLL loaded" instead of working
+
+### Changed
+- XInput DLL search unified into a candidate table — probes `xinput1_4`, `xinput1_3`, `xinput9_1_0` in order via `GetModuleHandleA` then `LoadLibraryA`; startup log now reports which DLL won and whether it was already in the process or loaded by the fallback
+- **Debug log (`DebugLog=1`) now covers all silent failure modes:**
+  - `Gamepad enabled but XInput hooks failed — keyboard only` — when `GamepadEnabled=1` but no hooks installed
+  - `Gamepad connected` / `Gamepad disconnected` — edge-detected from shadow buffer validity
+  - `Modifier pressed (buttons=0x…)` / `Modifier released` — edge-detected, only when a modifier is configured
+  - `Startup grace: suppressing speed X.XXx (Nms remaining)` — once per unique speed attempt during grace, so silent "buttons do nothing" is explained
+  - `Startup grace expired — speed changes active` — marks the exact tick when grace ends
+- **Strip log dedup fixed** — the `stripped==0` branch in the suppression logger was resetting `g_suppressLastLog` on every poll from the virtual XInput slot (which always returns `wButtons=0`), causing the next real poll to always log as if the mask had changed; the spurious reset is removed so dedup works across the full press duration
+
 ## v2.71 — 2026-04-02
 
 ### Fixed

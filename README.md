@@ -71,13 +71,14 @@ Speed=1.2
 ```ini
 [Settings]
 GamepadEnabled=1           ; 0 = keyboard only (skips XInput entirely)
-GamepadModifier=0020       ; Back/View (hold first)
+GamepadModifier=0020       ; Back/View (hold first). 0000 = no modifier (direct presses)
 GamepadIndex=0             ; Controller 0-3
 SuppressButtons=1          ; Hide modifier+speed buttons from game (prevents zoom toggle)
 ```
 
 Set `GamepadEnabled=0` to disable all gamepad functionality (no XInput loading or polling).
 Set a slot's `GamepadButton=0000` to disable its gamepad binding.
+Set `GamepadModifier=0000` for direct button presses with no modifier required.
 
 ## Combat Detection (optional)
 
@@ -113,9 +114,18 @@ SignatureOffset=3
 
 ## Troubleshooting
 
-Set `DebugLog=1` in the INI to generate `JustSkip.log`. Check that:
+Set `DebugLog=1` in the INI to generate `JustSkip.log`.
+
+**Basic checks:**
 - An ASI loader is present in `bin64/` (e.g. `winmm.dll`)
-- The log shows "QPC hook installed"
+- Log shows `QPC hook installed`
+
+**Gamepad not working:**
+- Log shows `XInput: using xinput1_4.dll` (or `1_3` / `9_1_0`) — confirms DLL found
+- Log shows `Gamepad connected` — confirms controller is seen via the hook
+- Log shows `Modifier pressed` when you hold Back/View — confirms button state reaches the mod (only logged when a modifier is configured)
+- Log shows `Startup grace: suppressing speed` — buttons work but grace period hasn't expired yet (default: 10s after launch)
+- If `Gamepad enabled but XInput hooks failed` appears, the game uses an unsupported XInput path; file a bug report with the full log
 
 ## Building from Source
 
